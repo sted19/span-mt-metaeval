@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "span-mt-metaeval"
+version = "0.1.0"
+description = "Machine translation evaluation toolkit with LLM-based metrics"
+authors = [{ name = "Amazon Science" }]
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+
+dependencies = [
+    # AWS integration (used in models/bedrock/ and data/cache.py for S3)
+    "boto3>=1.39.0",
+    "botocore>=1.39.0",
+    # Async AWS SDK (used in models/bedrock/ for async API calls)
+    "aioboto3>=14.0.0",
+    "aiobotocore>=2.21.0",
+    # WMT metrics evaluation (used in data/utils.py, meta_evaluation/)
+    "mt-metrics-eval",
+    # Output formatting (used in meta_evaluation/utils.py)
+    "tabulate>=0.9.0",
+    # JSON parsing repair for LLM outputs (used in autoevals/utils.py)
+    "json-repair>=0.50.0",
+    # YAML config parsing (used in config/)
+    "pyyaml>=6.0.2",
+]
+
+[project.optional-dependencies]
+# Local model inference (torch + HuggingFace)
+gpu = [
+    "torch>=2.8.0",
+    "transformers>=4.55.0",
+    "accelerate>=1.10.0",
+]
+# Development dependencies
+dev = [
+    "pytest>=9.0.0",
+    "black>=25.1.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+mt_evaluation = "src/mt_evaluation"
+
+[tool.black]
+line-length = 88
+target-version = ["py312"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
