@@ -40,6 +40,17 @@ and data handling practices. By using this package, you acknowledge that:
 Any use beyond personal experimentation with public data would require significant 
 security enhancements. If you have questions about appropriate use, consult your security team.
 
+## Data
+
+The experiment outputs (LLM-based evaluator error predictions) are stored 
+as compressed JSONL files for storage efficiency.
+
+To decompress all files:
+
+```bash
+find outputs/ -name "*.jsonl.gz" -exec gunzip {} \;
+```
+
 ## Installation
 Create a conda environment (Optional, but recommended) using Python >= 3.12 (< 3.14):
 ```bash

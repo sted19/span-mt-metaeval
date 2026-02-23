@@ -1,4 +1,8 @@
-outputs/
+outputs/**/*.jsonl
+!outputs/**/*.jsonl.gz
+
+.DS_Store
+
 logs/
 analysis/
 
