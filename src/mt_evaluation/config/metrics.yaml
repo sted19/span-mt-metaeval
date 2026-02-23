@@ -1,0 +1,121 @@
+# MT Evaluation Metrics Configuration
+# This file defines the metrics to evaluate and their configurations.
+
+# List of autoevals that do not produce extended spans
+autoevals_with_no_extended_spans:
+  - GemSpanEval.pri
+  - GemSpanEval-QE.sec
+  - AIP.pri
+  - AIP.sec
+  - AutoLQA.pri
+  - AutoLQA41.sec
+  - AutoLQAESA.sec
+  - XCOMET-XL.bas
+  - XCOMET-XXL.bas
+  - mqm.super.1
+  - mqm.super.2
+  - mqm.super.3
+
+# Metrics to evaluate for WMT25
+wmt25:
+  - autoeval: unified-mqm-boosted-v5
+    model: global.anthropic.claude-sonnet-4-5-20250929-v1:0
+    outputs_path: outputs
+    reference_free: true
+    run_specific_info: wmt25
+
+  - autoeval: unified-mqm-boosted-v5
+    model: global.anthropic.claude-haiku-4-5-20251001-v1:0
+    outputs_path: outputs
+    reference_free: true
+    run_specific_info: wmt25
+
+  - autoeval: unified-mqm-boosted-v5
+    model: qwen.qwen3-235b-a22b-2507-v1:0
+    outputs_path: outputs
+    reference_free: true
+    run_specific_info: wmt25
+
+  - autoeval: unified-mqm-boosted-v5
+    model: openai.gpt-oss-120b-1:0
+    outputs_path: outputs
+    reference_free: true
+    run_specific_info: wmt25
+
+# Metrics to evaluate for WMT24
+wmt24:
+  - autoeval: unified-mqm-boosted-v5
+    model: global.anthropic.claude-haiku-4-5-20251001-v1:0
+    outputs_path: outputs
+    reference_free: true
+    run_specific_info: wmt24
+
+  - autoeval: unified-mqm-boosted-v5
+    model: global.anthropic.claude-sonnet-4-5-20250929-v1:0
+    outputs_path: outputs
+    reference_free: true
+    run_specific_info: wmt24
+
+  - autoeval: unified-mqm-boosted-v5
+    model: qwen.qwen3-235b-a22b-2507-v1:0
+    outputs_path: outputs
+    reference_free: true
+    run_specific_info: wmt24
+
+  - autoeval: unified-mqm-boosted-v5
+    model: openai.gpt-oss-120b-1:0
+    outputs_path: outputs
+    reference_free: true
+    run_specific_info: wmt24
+
+# Metrics to evaluate for WMT23
+wmt23:
+  - autoeval: unified-mqm-boosted-v5
+    model: global.anthropic.claude-sonnet-4-5-20250929-v1:0
+    outputs_path: outputs
+    reference_free: true
+    run_specific_info: wmt23
+
+  - autoeval: unified-mqm-boosted-v5
+    model: global.anthropic.claude-haiku-4-5-20251001-v1:0
+    outputs_path: outputs
+    reference_free: true
+    run_specific_info: wmt23
+
+  - autoeval: unified-mqm-boosted-v5
+    model: qwen.qwen3-235b-a22b-2507-v1:0
+    outputs_path: outputs
+    reference_free: true
+    run_specific_info: wmt23
+
+  - autoeval: unified-mqm-boosted-v5
+    model: openai.gpt-oss-120b-1:0
+    outputs_path: outputs
+    reference_free: true
+    run_specific_info: wmt23
+
+# Metrics to evaluate for WMT22
+wmt22:
+  - autoeval: unified-mqm-boosted-v5
+    model: global.anthropic.claude-sonnet-4-5-20250929-v1:0
+    outputs_path: outputs
+    reference_free: true
+    run_specific_info: wmt22
+
+  - autoeval: unified-mqm-boosted-v5
+    model: global.anthropic.claude-haiku-4-5-20251001-v1:0
+    outputs_path: outputs
+    reference_free: true
+    run_specific_info: wmt22
+
+  - autoeval: unified-mqm-boosted-v5
+    model: qwen.qwen3-235b-a22b-2507-v1:0
+    outputs_path: outputs
+    reference_free: true
+    run_specific_info: wmt22
+
+  - autoeval: unified-mqm-boosted-v5
+    model: openai.gpt-oss-120b-1:0
+    outputs_path: outputs
+    reference_free: true
+    run_specific_info: wmt22

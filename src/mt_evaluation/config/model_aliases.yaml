@@ -1,0 +1,28 @@
+# Model Aliases Configuration
+# Maps full model IDs to short display names for readability in outputs/logs
+
+model_aliases:
+  # Claude models
+  "us.anthropic.claude-3-5-haiku-20241022-v1:0": "claude-3-5-haiku"
+  "us.anthropic.claude-3-7-sonnet-20250219-v1:0": "claude-3-7-sonnet"
+  "global.anthropic.claude-haiku-4-5-20251001-v1:0": "claude-haiku-4-5"
+  "global.anthropic.claude-sonnet-4-5-20250929-v1:0": "claude-sonnet-4-5"
+  
+  # Meta Llama models
+  "us.meta.llama3-3-70b-instruct-v1:0": "llama-3-3-70b"
+  "us.meta.llama3-1-8b-instruct-v1:0": "llama-3-1-8b"
+  "us.meta.llama3-2-11b-instruct-v1:0": "llama-3-2-11b"
+  "us.meta.llama4-scout-17b-instruct-v1:0": "llama-4-scout"
+  "us.meta.llama4-maverick-17b-instruct-v1:0": "llama-4-maverick"
+  
+  # HuggingFace models
+  "google/gemma-3-12b-it": "gemma-3-12b"
+  "meta-llama/Meta-Llama-3-8B-Instruct": "llama-3-8b"
+  
+  # Qwen models
+  "qwen.qwen3-235b-a22b-2507-v1:0": "qwen3-235b"
+  "qwen.qwen3-32b-v1:0": "qwen3-32b"
+  
+  # OpenAI models
+  "openai.gpt-oss-120b-1:0": "gpt-oss-120b"
+  "openai.gpt-oss-20b-1:0": "gpt-oss-20b"

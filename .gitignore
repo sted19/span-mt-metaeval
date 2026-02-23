@@ -1,0 +1,6 @@
+outputs/
+logs/
+analysis/
+
+# AWS configuration files with sensitive data
+configuration/
