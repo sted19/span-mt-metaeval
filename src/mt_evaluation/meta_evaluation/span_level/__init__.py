@@ -19,6 +19,7 @@ Submodules:
 from mt_evaluation.meta_evaluation.span_level.matching import (
     compute_overlap_length,
     find_greedy_bipartite_matching,
+    find_optimal_bipartite_matching,
     find_greedy_bipartite_matching_simple,
     compute_simple_tp_fp_fn,
     MatchInfo,

@@ -19,7 +19,9 @@ autoevals_with_no_extended_spans = [
     "mqm.super.3",
 ]
 
-metrics_to_evaluate_info_wmt25 = [
+metrics_to_evaluate_info_wmt25_esa = []
+
+metrics_to_evaluate_info_wmt25_mqm = [
     # {
     #     "autoeval": "unified-mqm-boosted-doc-context",
     #     "model": "global.anthropic.claude-sonnet-4-5-20250929-v1:0",

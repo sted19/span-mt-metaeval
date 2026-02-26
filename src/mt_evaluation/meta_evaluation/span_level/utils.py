@@ -10,7 +10,7 @@ between automatic evaluations and human (gold) annotations.
 The main high-level functions compute aggregated metrics across all samples.
 Lower-level functions are in:
 - standardization: Text and error standardization
-- preprocessing: Sample preprocessing 
+- preprocessing: Sample preprocessing
 - matching: Error bipartite matching algorithms
 """
 
@@ -19,8 +19,12 @@ import logging
 import numpy as np
 from collections import defaultdict
 
-from mt_evaluation.utils import convert_defaultdict_to_dict, setup_logging, get_metric_display_name
-from mt_evaluation.core import AutomaticEvaluation, HumanEvaluation, Sample
+from mt_evaluation.utils import (
+    convert_defaultdict_to_dict,
+    setup_logging,
+    get_metric_display_name,
+)
+from mt_evaluation.core import AutomaticEvaluation, Error, HumanEvaluation, Sample
 from mt_evaluation.meta_evaluation import all_severities, METRIC_TYPES, MetricResults
 
 from mt_evaluation.meta_evaluation.span_level.metrics import (
@@ -28,6 +32,10 @@ from mt_evaluation.meta_evaluation.span_level.metrics import (
     MicroMetrics,
     MacroMetrics,
     compute_p_r_f1_from_tp_fp_fn,
+    span_f_score_partial,
+    span_f_score_exact_match,
+    span_f_score_proportion_chars,
+    span_tp_char_counts,
 )
 from mt_evaluation.meta_evaluation.span_level.standardization import (
     standardize_automatic_evaluation,
@@ -39,6 +47,7 @@ from mt_evaluation.meta_evaluation.span_level.preprocessing import (
 from mt_evaluation.meta_evaluation.span_level.matching import (
     compute_overlap_length,
     find_greedy_bipartite_matching,
+    find_optimal_bipartite_matching,
     MatchInfo,
 )
 
@@ -53,6 +62,35 @@ def _get_match_info_as_tuple(match_info: MatchInfo) -> Tuple[float, int, int]:
     return (match_info.avg_overlap, match_info.overlap_length, match_info.matched_index)
 
 
+def _get_match_reward(
+    match_dict: Dict[int, MatchInfo],
+    error_idx: int,
+    error: Error,
+    other_errors: list,
+    p: float,
+) -> Union[Tuple[float, int, Error], None]:
+    """Look up a match and compute the severity-adjusted binary reward.
+
+    Args:
+        match_dict: Mapping from error index to MatchInfo.
+        error_idx: Index of the current error in its list.
+        error: The current error object.
+        other_errors: The list of errors on the other side (human or auto).
+        p: Severity penalty factor.
+
+    Returns:
+        (binary_reward, overlap_length, matched_error) if matched with
+        positive overlap, or None if unmatched.
+    """
+    match_info = match_dict.get(error_idx)
+    if not match_info or match_info.avg_overlap <= 0:
+        return None
+    matched_error = other_errors[match_info.matched_index]
+    severity_matches = error.severity == matched_error.severity
+    binary_reward = 1.0 if severity_matches else (1.0 - p)
+    return binary_reward, match_info.overlap_length, matched_error
+
+
 def process_single_autoeval_wrapper(args_tuple):
     """Wrapper for multiprocessing - unpacks arguments and calls process_single_autoeval"""
     (
@@ -63,6 +101,7 @@ def process_single_autoeval_wrapper(args_tuple):
         severity_penalty,
         remove_overlapping_errors,
         fix_edge_cases_in_precision,
+        use_greedy_matching,
         logging_level,
     ) = args_tuple
 
@@ -75,6 +114,7 @@ def process_single_autoeval_wrapper(args_tuple):
         severity_penalty=severity_penalty,
         remove_overlapping_errors=remove_overlapping_errors,
         fix_edge_cases_in_precision=fix_edge_cases_in_precision,
+        use_greedy_matching=use_greedy_matching,
     )
 
     return autoeval, autoeval_metrics
@@ -87,6 +127,7 @@ def process_single_autoeval(
     severity_penalty: float,
     remove_overlapping_errors: bool = False,
     fix_edge_cases_in_precision: bool = False,
+    use_greedy_matching: bool = False,
 ) -> Dict[str, Dict[str, Dict[str, Dict[str, MicroMetrics | MacroMetrics]]]]:
     autoeval_metrics = defaultdict(
         lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(None)))
@@ -101,6 +142,7 @@ def process_single_autoeval(
             severity_penalty=severity_penalty,
             has_overlapping_errors=not remove_overlapping_errors,
             fix_edge_cases_in_precision=fix_edge_cases_in_precision,
+            use_greedy_matching=use_greedy_matching,
         )
 
         results["not_matching"] = compute_all_tp_fp_fn(
@@ -110,6 +152,7 @@ def process_single_autoeval(
             severity_penalty=severity_penalty,
             has_overlapping_errors=not remove_overlapping_errors,
             fix_edge_cases_in_precision=fix_edge_cases_in_precision,
+            use_greedy_matching=False,
         )
 
         for aggr_type in ["micro", "macro"]:
@@ -124,7 +167,9 @@ def process_single_autoeval(
 
 
 def merge_autoevaluators(
-    lp2sys2samples_with_automatic_evaluations_list: List[Dict[str, Dict[str, List[Sample]]]],
+    lp2sys2samples_with_automatic_evaluations_list: List[
+        Dict[str, Dict[str, List[Sample]]]
+    ],
     strategy: str,
 ) -> Dict[str, Dict[str, List[Sample]]]:
     """Merge multiple autoevaluators using the specified strategy."""
@@ -138,10 +183,14 @@ def merge_autoevaluators(
         mt_systems = list(lp2sys2samples_with_automatic_evaluations_list[0][lp].keys())
         for sys in mt_systems:
             merged_lp2sys2samples[lp][sys] = []
-            num_samples = len(lp2sys2samples_with_automatic_evaluations_list[0][lp][sys])
+            num_samples = len(
+                lp2sys2samples_with_automatic_evaluations_list[0][lp][sys]
+            )
             for sample_idx in range(num_samples):
                 autoevaluator_samples = [
-                    lp2sys2samples_with_automatic_evaluations_list[idx][lp][sys][sample_idx]
+                    lp2sys2samples_with_automatic_evaluations_list[idx][lp][sys][
+                        sample_idx
+                    ]
                     for idx in range(num_autoevaluators)
                 ]
 
@@ -189,19 +238,30 @@ def merge_automatic_evaluations_by_union_with_overlap(
         for evaluation in evaluations
     ]
 
-    merged_annotations, merged_user_prompts, merged_system_prompts, total_cost = "", "", "", 0
+    merged_annotations, merged_user_prompts, merged_system_prompts, total_cost = (
+        "",
+        "",
+        "",
+        0,
+    )
     for idx, evaluation in enumerate(evaluations):
         merged_annotations += f"###Annotation-{idx}### - " + evaluation.annotation
         merged_user_prompts += f"###User Prompt-{idx}### - " + evaluation.user_prompt
-        merged_system_prompts += f"###System Prompt-{idx}### - " + evaluation.system_prompt
+        merged_system_prompts += (
+            f"###System Prompt-{idx}### - " + evaluation.system_prompt
+        )
         total_cost += evaluation.cost
 
     parsing_error = all(evaluation.parsing_error for evaluation in evaluations)
     if parsing_error:
         return AutomaticEvaluation(
-            score=0.0, errors=[], annotation=merged_annotations,
-            parsing_error=True, user_prompt=merged_user_prompts,
-            system_prompt=merged_system_prompts, cost=total_cost,
+            score=0.0,
+            errors=[],
+            annotation=merged_annotations,
+            parsing_error=True,
+            user_prompt=merged_user_prompts,
+            system_prompt=merged_system_prompts,
+            cost=total_cost,
         )
 
     all_errors = []
@@ -229,19 +289,30 @@ def merge_automatic_evaluations_by_union(
         for evaluation in evaluations
     ]
 
-    merged_annotations, merged_user_prompts, merged_system_prompts, total_cost = "", "", "", 0
+    merged_annotations, merged_user_prompts, merged_system_prompts, total_cost = (
+        "",
+        "",
+        "",
+        0,
+    )
     for idx, evaluation in enumerate(evaluations):
         merged_annotations += f"###Annotation-{idx}### - " + evaluation.annotation
         merged_user_prompts += f"###User Prompt-{idx}### - " + evaluation.user_prompt
-        merged_system_prompts += f"###System Prompt-{idx}### - " + evaluation.system_prompt
+        merged_system_prompts += (
+            f"###System Prompt-{idx}### - " + evaluation.system_prompt
+        )
         total_cost += evaluation.cost
 
     parsing_error = all(evaluation.parsing_error for evaluation in evaluations)
     if parsing_error:
         return AutomaticEvaluation(
-            score=0.0, errors=[], annotation=merged_annotations,
-            parsing_error=True, user_prompt=merged_user_prompts,
-            system_prompt=merged_system_prompts, cost=total_cost,
+            score=0.0,
+            errors=[],
+            annotation=merged_annotations,
+            parsing_error=True,
+            user_prompt=merged_user_prompts,
+            system_prompt=merged_system_prompts,
+            cost=total_cost,
         )
 
     all_errors = []
@@ -312,8 +383,14 @@ def decompose_counts(auto_counts: np.ndarray, human_counts: np.ndarray):
         auto_unmatched[:, i] = np.maximum(0.0, auto_rem - auto_mismatch[:, i])
         human_unmatched[:, i] = np.maximum(0.0, human_rem - human_mismatch[:, i])
 
-    return (auto_exact, auto_mismatch, auto_unmatched,
-            human_exact, human_mismatch, human_unmatched)
+    return (
+        auto_exact,
+        auto_mismatch,
+        auto_unmatched,
+        human_exact,
+        human_mismatch,
+        human_unmatched,
+    )
 
 
 def compute_tp_fp_fn_without_error_matching(
@@ -335,29 +412,49 @@ def compute_tp_fp_fn_without_error_matching(
     for auto_error in automatic_eval.errors:
         sev_idx = severity_to_idx[auto_error.severity]
         if auto_error.is_source_error:
-            auto_src_counts[sev_idx, auto_error.start:auto_error.end] += 1
+            auto_src_counts[sev_idx, auto_error.start : auto_error.end] += 1
         else:
-            auto_tgt_counts[sev_idx, auto_error.start:auto_error.end] += 1
+            auto_tgt_counts[sev_idx, auto_error.start : auto_error.end] += 1
 
     for human_error in human_eval.errors:
         sev_idx = severity_to_idx[human_error.severity]
         if human_error.is_source_error:
-            human_src_counts[sev_idx, human_error.start:human_error.end] += 1
+            human_src_counts[sev_idx, human_error.start : human_error.end] += 1
         else:
-            human_tgt_counts[sev_idx, human_error.start:human_error.end] += 1
+            human_tgt_counts[sev_idx, human_error.start : human_error.end] += 1
 
-    (auto_exact_src, auto_mismatch_src, auto_unmatched_src,
-     human_exact_src, human_mismatch_src, human_unmatched_src) = decompose_counts(auto_src_counts, human_src_counts)
+    (
+        auto_exact_src,
+        auto_mismatch_src,
+        auto_unmatched_src,
+        human_exact_src,
+        human_mismatch_src,
+        human_unmatched_src,
+    ) = decompose_counts(auto_src_counts, human_src_counts)
 
-    (auto_exact_tgt, auto_mismatch_tgt, auto_unmatched_tgt,
-     human_exact_tgt, human_mismatch_tgt, human_unmatched_tgt) = decompose_counts(auto_tgt_counts, human_tgt_counts)
+    (
+        auto_exact_tgt,
+        auto_mismatch_tgt,
+        auto_unmatched_tgt,
+        human_exact_tgt,
+        human_mismatch_tgt,
+        human_unmatched_tgt,
+    ) = decompose_counts(auto_tgt_counts, human_tgt_counts)
 
-    tpc = float(auto_exact_src.sum() + (1.0 - p) * auto_mismatch_src.sum() +
-                auto_exact_tgt.sum() + (1.0 - p) * auto_mismatch_tgt.sum())
-    fpc = float((p * auto_mismatch_src + auto_unmatched_src).sum() +
-                (p * auto_mismatch_tgt + auto_unmatched_tgt).sum())
-    fnc = float((p * human_mismatch_src + human_unmatched_src).sum() +
-                (p * human_mismatch_tgt + human_unmatched_tgt).sum())
+    tpc = float(
+        auto_exact_src.sum()
+        + (1.0 - p) * auto_mismatch_src.sum()
+        + auto_exact_tgt.sum()
+        + (1.0 - p) * auto_mismatch_tgt.sum()
+    )
+    fpc = float(
+        (p * auto_mismatch_src + auto_unmatched_src).sum()
+        + (p * auto_mismatch_tgt + auto_unmatched_tgt).sum()
+    )
+    fnc = float(
+        (p * human_mismatch_src + human_unmatched_src).sum()
+        + (p * human_mismatch_tgt + human_unmatched_tgt).sum()
+    )
 
     tp_for_precision, tp_for_recall, fp, fn = 0.0, 0.0, 0.0, 0.0
     tppc_for_precision, tppc_for_recall, fppc, fnpc = 0.0, 0.0, 0.0, 0.0
@@ -387,7 +484,9 @@ def compute_tp_fp_fn_without_error_matching(
             auto_unmatched_side = auto_unmatched_tgt
             human_same_sev = human_tgt_counts[sev_idx] > 0
 
-        error_mask = np.zeros(len(src) if auto_error.is_source_error else len(tgt), dtype=bool)
+        error_mask = np.zeros(
+            len(src) if auto_error.is_source_error else len(tgt), dtype=bool
+        )
         error_mask[start:end] = True
 
         overlap_any = int(np.sum(error_mask & human_any))
@@ -403,8 +502,13 @@ def compute_tp_fp_fn_without_error_matching(
         for i in range(start, end):
             a_s = float(auto_counts_side[sev_idx, i])
             if a_s > 0:
-                span_tp_char_sum += (auto_exact_side[sev_idx, i] + (1.0 - p) * auto_mismatch_side[sev_idx, i]) / a_s
-                span_fp_char_sum += (p * auto_mismatch_side[sev_idx, i] + auto_unmatched_side[sev_idx, i]) / a_s
+                span_tp_char_sum += (
+                    auto_exact_side[sev_idx, i]
+                    + (1.0 - p) * auto_mismatch_side[sev_idx, i]
+                ) / a_s
+                span_fp_char_sum += (
+                    p * auto_mismatch_side[sev_idx, i] + auto_unmatched_side[sev_idx, i]
+                ) / a_s
 
         tppc_for_precision += span_tp_char_sum / span_len
         fppc += span_fp_char_sum / span_len
@@ -429,7 +533,9 @@ def compute_tp_fp_fn_without_error_matching(
             human_unmatched_side = human_unmatched_tgt
             auto_same_sev = auto_tgt_counts[sev_idx] > 0
 
-        error_mask = np.zeros(len(src) if human_error.is_source_error else len(tgt), dtype=bool)
+        error_mask = np.zeros(
+            len(src) if human_error.is_source_error else len(tgt), dtype=bool
+        )
         error_mask[start:end] = True
 
         overlap_any = int(np.sum(error_mask & auto_any))
@@ -445,14 +551,34 @@ def compute_tp_fp_fn_without_error_matching(
         for i in range(start, end):
             h_s = float(human_counts_side[sev_idx, i])
             if h_s > 0:
-                span_tp_char_sum += (human_exact_side[sev_idx, i] + (1.0 - p) * human_mismatch_side[sev_idx, i]) / h_s
-                span_fn_char_sum += (p * human_mismatch_side[sev_idx, i] + human_unmatched_side[sev_idx, i]) / h_s
+                span_tp_char_sum += (
+                    human_exact_side[sev_idx, i]
+                    + (1.0 - p) * human_mismatch_side[sev_idx, i]
+                ) / h_s
+                span_fn_char_sum += (
+                    p * human_mismatch_side[sev_idx, i]
+                    + human_unmatched_side[sev_idx, i]
+                ) / h_s
 
         tppc_for_recall += span_tp_char_sum / span_len
         fnpc += span_fn_char_sum / span_len
 
-    return (0.0, 0.0, 0.0, tp_for_precision, tp_for_recall, fp, fn, tpc, fpc, fnc,
-            round(tppc_for_precision, 10), round(tppc_for_recall, 10), round(fppc, 10), round(fnpc, 10))
+    return (
+        0.0,
+        0.0,
+        0.0,
+        tp_for_precision,
+        tp_for_recall,
+        fp,
+        fn,
+        tpc,
+        fpc,
+        fnc,
+        round(tppc_for_precision, 10),
+        round(tppc_for_recall, 10),
+        round(fppc, 10),
+        round(fnpc, 10),
+    )
 
 
 def compute_tp_fp_fn_without_error_matching_without_overlaps(
@@ -477,16 +603,16 @@ def compute_tp_fp_fn_without_error_matching_without_overlaps(
     for auto_error in automatic_eval.errors:
         sev_idx = severity_to_idx[auto_error.severity]
         if auto_error.is_source_error:
-            auto_src_error_chars[sev_idx, auto_error.start:auto_error.end] = True
+            auto_src_error_chars[sev_idx, auto_error.start : auto_error.end] = True
         else:
-            auto_tgt_error_chars[sev_idx, auto_error.start:auto_error.end] = True
+            auto_tgt_error_chars[sev_idx, auto_error.start : auto_error.end] = True
 
     for human_error in human_eval.errors:
         sev_idx = severity_to_idx[human_error.severity]
         if human_error.is_source_error:
-            human_src_error_chars[sev_idx, human_error.start:human_error.end] = True
+            human_src_error_chars[sev_idx, human_error.start : human_error.end] = True
         else:
-            human_tgt_error_chars[sev_idx, human_error.start:human_error.end] = True
+            human_tgt_error_chars[sev_idx, human_error.start : human_error.end] = True
 
     for auto_error in automatic_eval.errors:
         auto_sev_idx = severity_to_idx[auto_error.severity]
@@ -497,16 +623,20 @@ def compute_tp_fp_fn_without_error_matching_without_overlaps(
             error_mask = np.zeros(len(tgt), dtype=bool)
             human_error_chars = human_tgt_error_chars
 
-        error_mask[auto_error.start:auto_error.end] = True
+        error_mask[auto_error.start : auto_error.end] = True
         overlap_chars = int(np.sum(error_mask & human_error_chars))
-        overlap_chars_matching = int(np.sum(error_mask & human_error_chars[auto_sev_idx]))
+        overlap_chars_matching = int(
+            np.sum(error_mask & human_error_chars[auto_sev_idx])
+        )
 
         if overlap_chars > 0:
             binary_reward = 1 if overlap_chars_matching > 0 else (1 - p)
             tp_for_precision += binary_reward
             fp += 1 - binary_reward
 
-            overlap_reward = overlap_chars_matching + (overlap_chars - overlap_chars_matching) * (1 - p)
+            overlap_reward = overlap_chars_matching + (
+                overlap_chars - overlap_chars_matching
+            ) * (1 - p)
             tpc += overlap_reward
             fpc += len(auto_error.span) - overlap_reward
 
@@ -527,16 +657,20 @@ def compute_tp_fp_fn_without_error_matching_without_overlaps(
             error_mask = np.zeros(len(tgt), dtype=bool)
             auto_error_chars = auto_tgt_error_chars
 
-        error_mask[human_error.start:human_error.end] = True
+        error_mask[human_error.start : human_error.end] = True
         overlap_chars = int(np.sum(error_mask & auto_error_chars))
-        overlap_chars_matching = int(np.sum(error_mask & auto_error_chars[human_sev_idx]))
+        overlap_chars_matching = int(
+            np.sum(error_mask & auto_error_chars[human_sev_idx])
+        )
 
         if overlap_chars > 0:
             binary_reward = 1 if overlap_chars_matching > 0 else (1 - p)
             tp_for_recall += binary_reward
             fn += 1 - binary_reward
 
-            overlap_reward = overlap_chars_matching + (overlap_chars - overlap_chars_matching) * (1 - p)
+            overlap_reward = overlap_chars_matching + (
+                overlap_chars - overlap_chars_matching
+            ) * (1 - p)
             fnc += len(human_error.span) - overlap_reward
 
             portion_reward = overlap_reward / len(human_error.span)
@@ -547,8 +681,22 @@ def compute_tp_fp_fn_without_error_matching_without_overlaps(
             fnc += len(human_error.span)
             fnpc += 1
 
-    return (0.0, 0.0, 0.0, tp_for_precision, tp_for_recall, fp, fn, tpc, fpc, fnc,
-            round(tppc_for_precision, 10), round(tppc_for_recall, 10), round(fppc, 10), round(fnpc, 10))
+    return (
+        0.0,
+        0.0,
+        0.0,
+        tp_for_precision,
+        tp_for_recall,
+        fp,
+        fn,
+        tpc,
+        fpc,
+        fnc,
+        round(tppc_for_precision, 10),
+        round(tppc_for_recall, 10),
+        round(fppc, 10),
+        round(fnpc, 10),
+    )
 
 
 def compute_tp_fp_fn_with_error_matching(
@@ -557,6 +705,7 @@ def compute_tp_fp_fn_with_error_matching(
     src: str,
     tgt: str,
     severity_penalty: float = 0.0,
+    use_greedy_matching: bool = False,
 ) -> Tuple[float, ...]:
     """Compute TP, FP, FN metrics using greedy 1-to-1 bipartite error matching."""
     p = float(severity_penalty)
@@ -566,77 +715,174 @@ def compute_tp_fp_fn_with_error_matching(
     tpc, fpc, fnc = 0.0, 0.0, 0.0
     tppc_for_precision, tppc_for_recall, fppc, fnpc = 0.0, 0.0, 0.0, 0.0
 
-    auto_matches_raw, human_matches_raw = find_greedy_bipartite_matching(
-        automatic_eval.errors, human_eval.errors, src, tgt, severity_penalty
-    )
+    if use_greedy_matching:
+        auto_matches_raw, human_matches_raw = find_greedy_bipartite_matching(
+            automatic_eval.errors, human_eval.errors, src, tgt, severity_penalty
+        )
+        # when using the greedy algorithm, a single matching is used for all measures
+        auto_matches_raw_em, human_matches_raw_em = auto_matches_raw, human_matches_raw
+        auto_matches_raw_p, human_matches_raw_p = auto_matches_raw, human_matches_raw
+        auto_matches_raw_c, human_matches_raw_c = auto_matches_raw, human_matches_raw
+        auto_matches_raw_pc, human_matches_raw_pc = auto_matches_raw, human_matches_raw
+    else:
+        # If not using greedy matching, compute a different optimal matching for each measure (exact match, character counts, character proportion) to give the automatic evaluation the best possible score for each measure.
+        auto_matches_raw_em, human_matches_raw_em = find_optimal_bipartite_matching(
+            automatic_eval.errors,
+            human_eval.errors,
+            src,
+            tgt,
+            span_f_score_exact_match,
+            severity_penalty,
+        )
+        auto_matches_raw_p, human_matches_raw_p = find_optimal_bipartite_matching(
+            automatic_eval.errors,
+            human_eval.errors,
+            src,
+            tgt,
+            span_f_score_partial,
+            severity_penalty,
+        )
+        auto_matches_raw_c, human_matches_raw_c = find_optimal_bipartite_matching(
+            automatic_eval.errors,
+            human_eval.errors,
+            src,
+            tgt,
+            span_tp_char_counts,
+            severity_penalty,
+        )
+        auto_matches_raw_pc, human_matches_raw_pc = find_optimal_bipartite_matching(
+            automatic_eval.errors,
+            human_eval.errors,
+            src,
+            tgt,
+            span_f_score_proportion_chars,
+            severity_penalty,
+        )
 
+    # --- Precision side: iterate over auto errors ---
     for i, auto_error in enumerate(automatic_eval.errors):
-        match_info = auto_matches_raw.get(i)
-        if match_info:
-            avg_overlap, lcs_len, matched_human_idx = _get_match_info_as_tuple(match_info)
-        else:
-            avg_overlap, lcs_len, matched_human_idx = 0.0, 0, -1
+        span_len = len(auto_error.span)
 
-        if avg_overlap > 0:
-            matched_human_error = human_eval.errors[matched_human_idx]
-            severity_matches = auto_error.severity == matched_human_error.severity
-            binary_reward = 1.0 if severity_matches else (1.0 - p)
-            exact_match_reward = (
-                binary_reward if auto_error.start == matched_human_error.start
-                and auto_error.end == matched_human_error.end else 0.0
+        # Exact Match (uses _em matching)
+        match = _get_match_reward(
+            auto_matches_raw_em, i, auto_error, human_eval.errors, p
+        )
+        if match:
+            binary_reward, lcs_len, matched_human = match
+            is_exact = (
+                auto_error.start == matched_human.start
+                and auto_error.end == matched_human.end
             )
-
+            exact_match_reward = binary_reward if is_exact else 0.0
             tp_em += exact_match_reward
             fp_em += 1.0 - exact_match_reward
+        else:
+            fp_em += 1.0
+
+        # Partial Overlap (uses _p matching)
+        match = _get_match_reward(
+            auto_matches_raw_p, i, auto_error, human_eval.errors, p
+        )
+        if match:
+            binary_reward, lcs_len, matched_human = match
             tp_for_precision += binary_reward
             fp += 1.0 - binary_reward
+        else:
+            fp += 1.0
 
+        # Character Counts (uses _c matching)
+        match = _get_match_reward(
+            auto_matches_raw_c, i, auto_error, human_eval.errors, p
+        )
+        if match:
+            binary_reward, lcs_len, matched_human = match
             overlap_chars_reward = lcs_len * binary_reward
             tpc += overlap_chars_reward
-            fpc += len(auto_error.span) - overlap_chars_reward
+            fpc += span_len - overlap_chars_reward
+        else:
+            fpc += span_len
 
-            portion_overlap_reward = (lcs_len / len(auto_error.span)) * binary_reward
+        # Character Proportion (uses _pc matching)
+        match = _get_match_reward(
+            auto_matches_raw_pc, i, auto_error, human_eval.errors, p
+        )
+        if match:
+            binary_reward, lcs_len, matched_human = match
+            portion_overlap_reward = (lcs_len / span_len) * binary_reward
             tppc_for_precision += portion_overlap_reward
             fppc += 1.0 - portion_overlap_reward
         else:
-            fp_em += 1.0
-            fp += 1.0
-            fpc += len(auto_error.span)
             fppc += 1.0
 
+    # --- Recall side: iterate over human errors ---
     for i, human_error in enumerate(human_eval.errors):
-        match_info = human_matches_raw.get(i)
-        if match_info:
-            avg_overlap, lcs_len, matched_auto_idx = _get_match_info_as_tuple(match_info)
-        else:
-            avg_overlap, lcs_len, matched_auto_idx = 0.0, 0, -1
+        span_len = len(human_error.span)
 
-        if avg_overlap > 0:
-            matched_auto_error = automatic_eval.errors[matched_auto_idx]
-            severity_matches = human_error.severity == matched_auto_error.severity
-            binary_reward = 1.0 if severity_matches else (1.0 - p)
-            exact_match_reward = (
-                binary_reward if human_error.start == matched_auto_error.start
-                and human_error.end == matched_auto_error.end else 0.0
+        # Exact Match (uses _em matching)
+        match = _get_match_reward(
+            human_matches_raw_em, i, human_error, automatic_eval.errors, p
+        )
+        if match:
+            binary_reward, lcs_len, matched_auto = match
+            is_exact = (
+                human_error.start == matched_auto.start
+                and human_error.end == matched_auto.end
             )
+            exact_match_reward = binary_reward if is_exact else 0.0
             fn_em += 1.0 - exact_match_reward
+        else:
+            fn_em += 1.0
+
+        # Partial Overlap (uses _p matching)
+        match = _get_match_reward(
+            human_matches_raw_p, i, human_error, automatic_eval.errors, p
+        )
+        if match:
+            binary_reward, lcs_len, matched_auto = match
             tp_for_recall += binary_reward
             fn += 1.0 - binary_reward
+        else:
+            fn += 1.0
 
+        # Character Counts (uses _c matching)
+        match = _get_match_reward(
+            human_matches_raw_c, i, human_error, automatic_eval.errors, p
+        )
+        if match:
+            binary_reward, lcs_len, matched_auto = match
             overlap_chars_reward = lcs_len * binary_reward
-            fnc += len(human_error.span) - overlap_chars_reward
+            fnc += span_len - overlap_chars_reward
+        else:
+            fnc += span_len
 
-            portion_overlap_reward = (lcs_len / len(human_error.span)) * binary_reward
+        # Character Proportion (uses _pc matching)
+        match = _get_match_reward(
+            human_matches_raw_pc, i, human_error, automatic_eval.errors, p
+        )
+        if match:
+            binary_reward, lcs_len, matched_auto = match
+            portion_overlap_reward = (lcs_len / span_len) * binary_reward
             tppc_for_recall += portion_overlap_reward
             fnpc += 1.0 - portion_overlap_reward
         else:
-            fn_em += 1.0
-            fn += 1.0
-            fnc += len(human_error.span)
             fnpc += 1.0
 
-    return (tp_em, fp_em, fn_em, tp_for_precision, tp_for_recall, fp, fn, tpc, fpc, fnc,
-            tppc_for_precision, tppc_for_recall, fppc, fnpc)
+    return (
+        tp_em,
+        fp_em,
+        fn_em,
+        tp_for_precision,
+        tp_for_recall,
+        fp,
+        fn,
+        tpc,
+        fpc,
+        fnc,
+        tppc_for_precision,
+        tppc_for_recall,
+        fppc,
+        fnpc,
+    )
 
 
 def compute_all_tp_fp_fn(
@@ -646,6 +892,7 @@ def compute_all_tp_fp_fn(
     severity_penalty: float = 0.0,
     has_overlapping_errors: bool = False,
     fix_edge_cases_in_precision: bool = False,
+    use_greedy_matching: bool = False,
 ) -> Dict[str, Dict[str, MicroMetrics | MacroMetrics]]:
     """Compute aggregated TP, FP, FN for all samples."""
     confusion_matrices = {metric_type: MicroMetrics() for metric_type in METRIC_TYPES}
@@ -663,7 +910,12 @@ def compute_all_tp_fp_fn(
 
         if do_error_matching:
             res = compute_tp_fp_fn_with_error_matching(
-                automatic_eval, human_eval, src, tgt, severity_penalty
+                automatic_eval,
+                human_eval,
+                src,
+                tgt,
+                severity_penalty,
+                use_greedy_matching,
             )
         else:
             if has_overlapping_errors:
@@ -675,23 +927,49 @@ def compute_all_tp_fp_fn(
                     automatic_eval, human_eval, src, tgt, severity_penalty
                 )
 
-        (tp_em, fp_em, fn_em, tp_for_precision, tp_for_recall, fp, fn,
-         tpc, fpc, fnc, tppc_for_precision, tppc_for_recall, fppc, fnpc) = res
+        (
+            tp_em,
+            fp_em,
+            fn_em,
+            tp_for_precision,
+            tp_for_recall,
+            fp,
+            fn,
+            tpc,
+            fpc,
+            fnc,
+            tppc_for_precision,
+            tppc_for_recall,
+            fppc,
+            fnpc,
+        ) = res
 
         confusion_matrices["Exact\nMatch"].update(tp_em, tp_em, fp_em, fn_em)
-        confusion_matrices["Partial\nOverlap"].update(tp_for_precision, tp_for_recall, fp, fn)
+        confusion_matrices["Partial\nOverlap"].update(
+            tp_for_precision, tp_for_recall, fp, fn
+        )
         confusion_matrices["Character\nCounts"].update(tpc, tpc, fpc, fnc)
-        confusion_matrices["Character\nProportion"].update(tppc_for_precision, tppc_for_recall, fppc, fnpc)
+        confusion_matrices["Character\nProportion"].update(
+            tppc_for_precision, tppc_for_recall, fppc, fnpc
+        )
 
-        p_em, r_em, f1_em = compute_p_r_f1_from_tp_fp_fn(tp_em, tp_em, fp_em, fn_em)
-        p, r, f1 = compute_p_r_f1_from_tp_fp_fn(tp_for_precision, tp_for_recall, fp, fn, fix_edge_cases_in_precision)
-        pc, rc, f1c = compute_p_r_f1_from_tp_fp_fn(tpc, tpc, fpc, fnc, fix_edge_cases_in_precision)
-        ppc, rpc, f1pc = compute_p_r_f1_from_tp_fp_fn(tppc_for_precision, tppc_for_recall, fppc, fnpc, fix_edge_cases_in_precision)
+        p_em, r_em, f1_em = compute_p_r_f1_from_tp_fp_fn(
+            tp_em, tp_em, fp_em, fn_em, fix_edge_cases_in_precision
+        )
+        p, r, f1 = compute_p_r_f1_from_tp_fp_fn(
+            tp_for_precision, tp_for_recall, fp, fn, fix_edge_cases_in_precision
+        )
+        pc, rc, f1c = compute_p_r_f1_from_tp_fp_fn(
+            tpc, tpc, fpc, fnc, fix_edge_cases_in_precision
+        )
+        ppc, rpc, f1pc = compute_p_r_f1_from_tp_fp_fn(
+            tppc_for_precision, tppc_for_recall, fppc, fnpc, fix_edge_cases_in_precision
+        )
 
-        macro_metrics["Exact\nMatch"].update(p_em, r_em)
-        macro_metrics["Partial\nOverlap"].update(p, r)
-        macro_metrics["Character\nCounts"].update(pc, rc)
-        macro_metrics["Character\nProportion"].update(ppc, rpc)
+        macro_metrics["Exact\nMatch"].update(p_em, r_em, f1_em)
+        macro_metrics["Partial\nOverlap"].update(p, r, f1)
+        macro_metrics["Character\nCounts"].update(pc, rc, f1c)
+        macro_metrics["Character\nProportion"].update(ppc, rpc, f1pc)
 
     return {"micro": confusion_matrices, "macro": macro_metrics}
 
@@ -714,10 +992,14 @@ def merge_autoevaluators_based_on_info(
         for metric_entry in metrics_to_merge
     ]
 
-    assert all(metric_name in metric_name2lp2sys2samples for metric_name in metrics_to_merge_names)
+    assert all(
+        metric_name in metric_name2lp2sys2samples
+        for metric_name in metrics_to_merge_names
+    )
 
     list_of_metrics_to_merge = [
-        metric_name2lp2sys2samples[metric_name] for metric_name in metrics_to_merge_names
+        metric_name2lp2sys2samples[metric_name]
+        for metric_name in metrics_to_merge_names
     ]
 
     merged_scores = merge_autoevaluators(list_of_metrics_to_merge, merging_strategy)
@@ -730,7 +1012,9 @@ def aggregate_metrics(
 ) -> Dict[str, Dict[str, Dict[str, Dict[str, Dict[str, Metrics]]]]]:
     """Aggregate metrics over the language pair dimension."""
     global_metrics = defaultdict(
-        lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(None))))
+        lambda: defaultdict(
+            lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(None)))
+        )
     )
 
     for autoeval, lp2aggr2match2tp in metrics.items():
@@ -747,7 +1031,9 @@ def aggregate_metrics(
             for aggr, match2tp in aggr2match2tp.items():
                 for match, tp2metrics in match2tp.items():
                     for tp, tp_metrics in tp2metrics.items():
-                        global_metrics[autoeval][lp_key][aggr][match][tp].update(*tp_metrics.get_values())
+                        global_metrics[autoeval][lp_key][aggr][match][tp].update(
+                            *tp_metrics.get_values()
+                        )
 
     return global_metrics
 
@@ -765,6 +1051,8 @@ def compute_results_from_metrics(
             for aggr, match2tp2metrics in aggr2match2tp2metrics.items():
                 for match, tp2metrics in match2tp2metrics.items():
                     for tp, m in tp2metrics.items():
-                        results[lp][aggr][match][autoeval].update(tp, *list(m.get_precision_recall_f1()))
+                        results[lp][aggr][match][autoeval].update(
+                            tp, *list(m.get_precision_recall_f1())
+                        )
 
     return results

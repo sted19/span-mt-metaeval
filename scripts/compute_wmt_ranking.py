@@ -16,7 +16,7 @@ from mt_evaluation.meta_evaluation.metrics_to_evaluate import (
     metrics_to_evaluate_info_wmt24,
     metrics_to_evaluate_info_wmt23,
     metrics_to_evaluate_info_wmt22,
-    metrics_to_evaluate_info_wmt25,
+    metrics_to_evaluate_info_wmt25_mqm,
 )
 from mt_evaluation.data import (
     get_raters_evaluations,
@@ -586,7 +586,7 @@ def main() -> None:
         "wmt22": metrics_to_evaluate_info_wmt22,
         "wmt23": metrics_to_evaluate_info_wmt23,
         "wmt24": metrics_to_evaluate_info_wmt24,
-        "wmt25": metrics_to_evaluate_info_wmt25,
+        "wmt25": metrics_to_evaluate_info_wmt25_mqm,
     }
     autoeval2lp2sys2samples_with_automatic_evaluations = (
         get_autoeval2lp2sys2samples_with_automatic_evaluations(

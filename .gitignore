@@ -5,6 +5,7 @@ outputs/**/*.jsonl
 
 logs/
 analysis/
+data/
 
 # AWS configuration files with sensitive data
 configuration/

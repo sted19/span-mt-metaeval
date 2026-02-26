@@ -50,25 +50,35 @@ def standardize_text(text: str) -> str:
     if text is None:
         raise ValueError("You passed a None text")
 
-    # Convert to string and lowercase
-    text = str(text).lower()
-
     # Normalize quotation marks - replace various quote types with standard ASCII quotes
-    symbol_mapping = {
-        "“": '"',  # Left double quotation mark
-        "”": '"',  # right double quotation mark
-        "’": "'",  # Left single quotation mark
-        "‘": "'",  # Right single quotation mark
-        "«": '"',  # Left-pointing double angle quotation mark
-        "»": '"',  # Right-pointing double angle quotation mark
-        "‹": "'",  # Single left-pointing angle quotation mark
-        "›": "'",  # Single right-pointing angle quotation mark"
-    }
+    symbol_mapping = str.maketrans(
+        {
+            "“": '"',  # Left double quotation mark
+            "”": '"',  # right double quotation mark
+            "’": "'",  # Left single quotation mark
+            "‘": "'",  # Right single quotation mark
+            "«": '"',  # Left-pointing double angle quotation mark
+            "»": '"',  # Right-pointing double angle quotation mark
+            "‹": "'",  # Single left-pointing angle quotation mark
+            "›": "'",  # Single right-pointing angle quotation mark"
+        }
+    )
 
-    for symbol, standard_symbol in symbol_mapping.items():
-        text = text.replace(symbol, standard_symbol)
+    std_text = []
+    for ch in text.translate(symbol_mapping):
+        lower_ch = ch.lower()
+        if len(lower_ch) == 1:
+            std_text.append(lower_ch)
+        else:
+            std_text.append(ch)
 
-    return text
+    std_text = "".join(std_text)
+
+    assert len(std_text) == len(
+        text
+    ), f"Standardization should not change text length! Original: {text}, Standardized: {std_text}"
+
+    return std_text
 
 
 def standardize_severity(severity: str, transform_critical_into_major: bool) -> str:

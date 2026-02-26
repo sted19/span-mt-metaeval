@@ -425,6 +425,39 @@ class Sample:
             seg_id=data.get("seg_id"),
         )
 
+    def __repr__(self) -> str:
+        """Readable multi-line representation for easy inspection."""
+        trunc = lambda s, n=80: (s[:n] + "…") if s and len(s) > n else s
+        lines = [
+            "Sample(",
+            f"  src_lang={self.src_lang!r} → tgt_lang={self.tgt_lang!r},",
+            f"  doc_id={self.doc_id!r}, seg_id={self.seg_id!r},",
+            f"  src={trunc(self.src)!r},",
+            f"  tgt={trunc(self.tgt)!r},",
+        ]
+        if self.evaluation:
+            e = self.evaluation
+            lines.append(
+                f"  evaluation=AutomaticEvaluation(score={e.score}, "
+                f"errors={len(e.errors)}, parsing_error={e.parsing_error}),"
+            )
+        else:
+            lines.append("  evaluation=None,")
+        if self.human_evaluation:
+            h = self.human_evaluation
+            lines.append(
+                f"  human_evaluation=HumanEvaluation(score={h.score}, "
+                f"errors={len(h.errors)}, rater={h.rater!r}),"
+            )
+        else:
+            lines.append("  human_evaluation=None,")
+        lines.append(")")
+        return "\n".join(lines)
+
+    def __str__(self) -> str:
+        """Return the same readable representation as repr."""
+        return self.__repr__()
+
     def __hash__(self) -> int:
         """
         Hash for use in sets/dicts based on input fields only.

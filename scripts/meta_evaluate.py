@@ -15,6 +15,7 @@ from mt_evaluation.core import (
     wmt24_lps,
     wmt25_lps,
     wmt25_lps_mqm,
+    wmt25_lps_esa,
     UNKNOWN_SEVERITY,
 )
 from mt_evaluation.meta_evaluation import MetricStats
@@ -28,7 +29,8 @@ from mt_evaluation.data.utils import (
 )
 from mt_evaluation.data.wmt_loaders import enes_subcategory_to_category_mapping
 from mt_evaluation.meta_evaluation.metrics_to_evaluate import (
-    metrics_to_evaluate_info_wmt25,
+    metrics_to_evaluate_info_wmt25_mqm,
+    metrics_to_evaluate_info_wmt25_esa,
     metrics_to_evaluate_info_wmt24,
     metrics_to_evaluate_info_wmt23,
     metrics_to_evaluate_info_wmt22,
@@ -61,7 +63,6 @@ from mt_evaluation.meta_evaluation.span_level.perturbations import (
     ALL_PERTURBATIONS,
 )
 
-
 # NOTE: aspects of the meta-evaluation to remember
 #   HANDLING OF HUMAN ERRORS
 #  1. We are not considering neutral errors even for the span-based matching (to be coherent with their MQM score of 0)
@@ -69,6 +70,8 @@ from mt_evaluation.meta_evaluation.span_level.perturbations import (
 #   ............................
 #   HANDLING OF AUTOMATIC ERRORS
 #  1. Ill-formed errors (i.e., empty errors, or those whose text is not entirely contained in the translation or the source), are excluded from the evaluation
+#   HANDLING OF MATCHING ALGORITHMS
+#  1. By default, we use optimal matching (in terms of f1_with_partial_overlap_and_partial_credit). This is used also for exact_match and partial_overlap, despite it might (might it?) be not optimal for them. This behavior is incorrect and must be edited.
 
 
 # NOTE: predominant LLM errors and parsing errors
@@ -85,34 +88,42 @@ def main():
 
     setup_logging(args.logging_level)
 
-    test_set2lps = {
-        "wmt22": wmt22_lps,
-        "wmt23": wmt23_lps,
-        "wmt24": wmt24_lps,
-        "wmt25": wmt25_lps_mqm,
+    test_set2protocol2lps = {
+        "wmt22": {"mqm": wmt22_lps},
+        "wmt23": {"mqm": wmt23_lps},
+        "wmt24": {"mqm": wmt24_lps},
+        "wmt25": {"mqm": wmt25_lps_mqm, "esa": wmt25_lps_esa},
     }
 
-    test_set2metrics_to_evaluate = {
-        "wmt22": metrics_to_evaluate_info_wmt22,
-        "wmt23": metrics_to_evaluate_info_wmt23,
-        "wmt24": metrics_to_evaluate_info_wmt24,
-        "wmt25": metrics_to_evaluate_info_wmt25,
+    test_set2protocol2metrics_to_evaluate = {
+        "wmt22": {"mqm": metrics_to_evaluate_info_wmt22},
+        "wmt23": {"mqm": metrics_to_evaluate_info_wmt23},
+        "wmt24": {"mqm": metrics_to_evaluate_info_wmt24},
+        "wmt25": {
+            "mqm": metrics_to_evaluate_info_wmt25_mqm,
+            "esa": metrics_to_evaluate_info_wmt25_esa,
+        },
     }
 
     test_sets = args.test_sets
+    annotation_protocol = args.annotation_protocol
 
     if len(test_sets) > 1:
         metrics_to_evaluate = set(
             [
                 autoeval_entry["autoeval"] + autoeval_entry["model"]
-                for autoeval_entry in test_set2metrics_to_evaluate[test_sets[0]]
+                for autoeval_entry in test_set2protocol2metrics_to_evaluate[
+                    test_sets[0]
+                ][annotation_protocol]
             ]
         )
         assert all(
             set(
                 [
                     autoeval_entry["autoeval"] + autoeval_entry["model"]
-                    for autoeval_entry in test_set2metrics_to_evaluate[test_set]
+                    for autoeval_entry in test_set2protocol2metrics_to_evaluate[
+                        test_set
+                    ][annotation_protocol]
                 ]
             )
             == metrics_to_evaluate
@@ -123,14 +134,15 @@ def main():
     test_set2lp2sys2samples_with_human_evaluations = dict()
     for test_set in test_sets:
 
-        lps = test_set2lps[test_set]
+        lps = test_set2protocol2lps[test_set][annotation_protocol]
         lps = args.lps if args.lps is not None else lps
 
         logger.info(f"Evaluating {test_set} on {lps}")
 
         super_raters = (
             [args.gold_rating_key]
-            if test_set == "wmt24" or test_set == "wmt25"
+            if test_set == "wmt24"
+            or (test_set == "wmt25" and annotation_protocol == "mqm")
             else [args.gold_rating_key] + args.human_as_a_metric_rating_keys
         )
 
@@ -138,6 +150,7 @@ def main():
             test_set,
             lps,
             use_merged_annotations=args.use_merged_annotations,
+            annotation_protocol=annotation_protocol,
         )
 
         super_rater2lp2sys2samples = get_super_raters_from_raters(
@@ -163,7 +176,9 @@ def main():
             str, Dict[str, Dict[str, List[Sample]]]
         ] = get_autoeval2lp2sys2samples_with_automatic_evaluations(
             lp2sys2samples=lp2sys2samples_with_human_evaluations,
-            metrics_to_evaluate_info=test_set2metrics_to_evaluate[test_set],
+            metrics_to_evaluate_info=test_set2protocol2metrics_to_evaluate[test_set][
+                annotation_protocol
+            ],
             do_not_verify_completeness=args.do_not_verify_completeness,
         )
 
@@ -517,6 +532,7 @@ def main():
             args.severity_penalty,
             args.remove_overlapping_errors,
             args.fix_edge_cases_in_precision,
+            args.use_greedy_matching,
             args.logging_level,
         )
         for autoeval, lp2preprocessed_samples_with_automatic_evaluations in autoeval2lp2preprocessed_samples_with_automatic_evaluations.items()
@@ -592,6 +608,12 @@ def read_arguments() -> argparse.ArgumentParser:
         nargs="+",
         default=["wmt24"],
         help="The test sets to run the meta-evaluation on",
+    )
+    parser.add_argument(
+        "--annotation-protocol",
+        type=str,
+        default="mqm",
+        help="The annotation protocols to use for the evaluation, in {esa, mqm} (default: mqm)",
     )
     parser.add_argument(
         "--logging-level",
@@ -707,6 +729,11 @@ def read_arguments() -> argparse.ArgumentParser:
     parser.add_argument(
         "--do-not-load-wmt25-submissions",
         action="store_true",
+    )
+    parser.add_argument(
+        "--use-greedy-matching",
+        action="store_true",
+        help="Whether to use greedy matching instead of optimal matching when computing the metrics.",
     )
 
     return parser

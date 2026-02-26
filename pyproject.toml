@@ -26,6 +26,8 @@ dependencies = [
     "json-repair>=0.50.0",
     # YAML config parsing (used in config/)
     "pyyaml>=6.0.2",
+    # Optimal bipartite matching (used in meta_evaluation/span_level/matching.py)
+    "scipy>=1.14.0",
 ]
 
 [project.optional-dependencies]
@@ -43,9 +45,6 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-dir]
-mt_evaluation = "src/mt_evaluation"
 
 [tool.black]
 line-length = 88

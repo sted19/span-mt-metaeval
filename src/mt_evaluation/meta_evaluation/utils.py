@@ -30,7 +30,6 @@ from mt_evaluation.utils import get_metric_display_name
 from mt_evaluation.core import Sample
 from mt_evaluation.utils import is_all_nones
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -540,7 +539,7 @@ def print_results(
         [metrics_results_matching, metrics_results_no_matching]
     ):
 
-        print("GREEDY BIPARTITE MATCHING") if i == 0 else print("NO MATCHING")
+        print("WITH MATCHING") if i == 0 else print("NO MATCHING")
         print("-" * 50)
 
         micro_table_data = []
@@ -587,7 +586,7 @@ def print_results(
         [metrics_results_matching_macro, metrics_results_no_matching_macro]
     ):
 
-        print("GREEDY BIPARTITE MATCHING") if i == 0 else print("NO MATCHING")
+        print("WITH MATCHING") if i == 0 else print("NO MATCHING")
         print("-" * 50)
 
         macro_table_data = []
@@ -715,7 +714,7 @@ def print_sentinel_counts(
 
         for match_type in ["matching", "not_matching"]:
             (
-                print("GREEDY BIPARTITE MATCHING")
+                print("WITH MATCHING")
                 if match_type == "matching"
                 else print("NO MATCHING")
             )

@@ -144,12 +144,10 @@ Autoeval2Lp2Samples = Dict[str, Lp2Samples]
 # Metrics-related nested dictionary types
 # =============================================================================
 
-# metric_type -> Metrics (e.g., "Exact
-Match" -> MicroMetrics)
+# metric_type -> Metrics (e.g., "Exact Match" -> MicroMetrics)
 MetricType2Metrics = Dict[str, "Metrics"]
 
-# matching_type -> metric_type -> Metrics (e.g., "matching" -> "Exact
-Match" -> Metrics)
+# matching_type -> metric_type -> Metrics (e.g., "matching" -> "Exact Match" -> Metrics)
 MatchType2MetricType2Metrics = Dict[str, MetricType2Metrics]
 
 # aggregation_type -> matching_type -> metric_type -> Metrics

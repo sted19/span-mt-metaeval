@@ -10,7 +10,7 @@ including TSV submissions, raw JSON/JSONL files, and mt-metrics-eval data.
 
 import json
 import logging
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from collections import defaultdict
 from pathlib import Path
 
@@ -18,7 +18,8 @@ from mt_metrics_eval import data as mt_metrics_eval_data
 from mt_metrics_eval import ratings as mt_metrics_eval_ratings
 
 from mt_evaluation.core import Sample, HumanEvaluation, Error, AutomaticEvaluation
-from mt_evaluation.core import no_error, no_error2, wmt25_lps_mqm
+from mt_evaluation.core import no_error, no_error2, wmt25_lps_mqm, wmt25_lps_esa
+from mt_evaluation.core import no_error, no_error2, wmt25_lps_mqm, wmt25_lps_esa
 from mt_evaluation.core.scoring import assign_score_based_on_severity
 from mt_evaluation.utils import find_all_literal
 from mt_evaluation.data.language_codes import lang_code2lang
@@ -37,6 +38,57 @@ enes_subcategory_to_category_mapping = {
     "omission": "accuracy",
     "addition": "accuracy",
 }
+
+
+# NOTE: this is unused as we are not using annotated_tgt anymore. We are keeping this here in case we want to use it to check whether there are errors in the alignment between tgt and tgt_annotated.
+def get_wmt25_submissions_error_span(
+    autoeval_name: str,
+    start_i: int,
+    end_i: int,
+    tgt: str,
+    tgt_annotated: str,
+    fix_indices_with_tgt_annotated: bool = False,
+    autoevals_to_fix: List[str] = ["AIP.pri"],
+) -> Tuple[str | None, int, int, bool]:
+    could_not_find_error_int_tgt = False
+    if (
+        any(autoeval in autoeval_name for autoeval in autoevals_to_fix)
+        and fix_indices_with_tgt_annotated
+    ):
+        if start_i == end_i or start_i >= len(tgt_annotated):
+            return None, start_i, end_i, could_not_find_error_int_tgt
+        error_span = tgt_annotated[start_i:end_i]
+
+        if error_span not in tgt:
+            logger.debug("Annotated error span not in tgt!")
+            error_span = tgt[start_i:end_i]
+            could_not_find_error_int_tgt = True
+        else:
+            matches = find_all_literal(tgt, error_span)
+
+            differences = [
+                (
+                    abs(start_i - fixed_start_i),
+                    abs(end_i - fixed_end_i),
+                    fixed_start_i,
+                    fixed_end_i,
+                )
+                for fixed_start_i, fixed_end_i in matches
+            ]
+
+            sorted_differences = sorted(differences, key=lambda x: (x[0], x[1]))
+
+            start_i, end_i = (
+                sorted_differences[0][2],
+                sorted_differences[0][3],
+            )
+
+    else:
+        if start_i == end_i or start_i >= len(tgt):
+            return None, start_i, end_i, could_not_find_error_int_tgt
+        error_span = tgt[start_i:end_i]
+
+    return error_span, start_i, end_i, could_not_find_error_int_tgt
 
 
 def parse_tsv_wmt25_submission(
@@ -60,8 +112,8 @@ def parse_tsv_wmt25_submission(
     Returns:
         Dictionary mapping lp -> system -> samples with automatic evaluations
     """
-    data = []
 
+    auto_lp2sys2error_list = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     with open(filepath, "r", encoding="utf-8") as f:
         # Read header
         header = f.readline().strip().split("\t")
@@ -92,118 +144,94 @@ def parse_tsv_wmt25_submission(
                 else:
                     row[col_name] = value
 
-            data.append(row)
+            assert len(row["start_indices"]) == len(row["end_indices"])
+            if not len(row["error_types"]) >= len(row["start_indices"]):
+                logger.debug(
+                    "Error types have fewer entries than start/end indices, truncating start/end indices to match error types!"
+                )
+                row["start_indices"] = row["start_indices"][: len(row["error_types"])]
+                row["end_indices"] = row["end_indices"][: len(row["error_types"])]
 
-    num_total_errors, num_errors_impossible_to_find = 0, 0
+            if row["set_id"] != "official":
+                continue
+
+            errors = []
+            for start_i, end_i, severity in zip(
+                row["start_indices"],
+                row["end_indices"],
+                row["error_types"],
+            ):
+                if no_error in severity or no_error2 in severity:
+                    continue
+
+                assert start_i > -1 and end_i > -1
+
+                errors.append(
+                    {
+                        "start_i": start_i,
+                        "end_i": end_i,
+                        "severity": severity,
+                    }
+                )
+
+            auto_lp2sys2error_list[lp][row["system_id"]][row["segment_id"]] = errors
+
     auto_lp2sys2samples = defaultdict(lambda: defaultdict(list))
     for lp, sys2samples in gold_lp2sys2samples.items():
         for sys, samples in sys2samples.items():
-            for sample in samples:
-                assigned = 0
-                for elem in data:
-                    if (
-                        elem["doc_id"] == sample.doc_id
-                        and elem["segment_id"] == sample.seg_id
-                        and elem["system_id"] == sys
-                    ):
+            list_of_errors_list = auto_lp2sys2error_list[lp][sys]
 
-                        assert len(elem["start_indices"]) == len(elem["end_indices"])
-                        assert len(elem["error_types"]) >= len(elem["start_indices"])
+            annotated_list_of_errors_list = [
+                list_of_errors_list[sample.seg_id] for sample in samples
+            ]
 
-                        if elem["set_id"] != "official":
-                            continue
+            for sample, error_list in zip(samples, annotated_list_of_errors_list):
 
-                        errors = []
-                        for start_i, end_i, severity in zip(
-                            elem["start_indices"],
-                            elem["end_indices"],
-                            elem["error_types"],
-                        ):
-                            if no_error in severity or no_error2 in severity:
-                                continue
+                auto_sample = Sample.from_dict(sample.to_dict())
 
-                            assert start_i > -1 and end_i > -1
+                tgt = auto_sample.tgt
 
-                            autoevals_to_fix = ["AIP.pri"]
-                            if (
-                                any(
-                                    autoeval in autoeval_name
-                                    for autoeval in autoevals_to_fix
-                                )
-                                and fix_indices_with_tgt_annotated
-                            ):
-                                if start_i == end_i or start_i >= len(
-                                    sample.tgt_annotated
-                                ):
-                                    continue
-                                error_span = sample.tgt_annotated[start_i:end_i]
+                errors = []
+                for raw_error in error_list:
+                    start_i, end_i, severity = (
+                        raw_error["start_i"],
+                        raw_error["end_i"],
+                        raw_error["severity"],
+                    )
 
-                                if error_span not in sample.tgt:
-                                    logger.debug("Annotated error span not in tgt!")
-                                    error_span = sample.tgt[start_i:end_i]
-                                    num_errors_impossible_to_find += 1
-                                else:
-                                    matches = find_all_literal(sample.tgt, error_span)
-
-                                    differences = [
-                                        (
-                                            abs(start_i - fixed_start_i),
-                                            abs(end_i - fixed_end_i),
-                                            fixed_start_i,
-                                            fixed_end_i,
-                                        )
-                                        for fixed_start_i, fixed_end_i in matches
-                                    ]
-
-                                    sorted_differences = sorted(
-                                        differences, key=lambda x: (x[0], x[1])
-                                    )
-
-                                    start_i, end_i = (
-                                        sorted_differences[0][2],
-                                        sorted_differences[0][3],
-                                    )
-
-                            else:
-                                if start_i == end_i or start_i >= len(sample.tgt):
-                                    continue
-                                error_span = sample.tgt[start_i:end_i]
-
-                            errors.append(
-                                Error(
-                                    span=error_span,
-                                    category="",
-                                    severity=severity,
-                                    start=start_i,
-                                    end=end_i,
-                                    is_source_error=False,
-                                    score=assign_score_based_on_severity(severity),
-                                    explanation="",
-                                    extended_span=None,
-                                )
-                            )
-                            num_total_errors += 1
-
-                        evaluation = AutomaticEvaluation(
-                            score=sum(error.score for error in errors),
-                            errors=errors,
-                            annotation="",
-                            parsing_error=False,
+                    if start_i == end_i or start_i >= len(tgt):
+                        logger.debug(
+                            f"Invalid error span with {start_i} == end_i or start_i >= len(tgt)! skipping this error. autoeval_name={autoeval_name}, lp={lp}, sys={sys}, doc_id={auto_sample.doc_id}, seg_id={auto_sample.seg_id}"
                         )
+                        continue
 
-                        auto_sample = Sample.from_dict(sample.to_dict())
-                        auto_sample.human_evaluation = None
-                        auto_sample.evaluation = evaluation
+                    error_span = tgt[start_i:end_i]
 
-                        auto_lp2sys2samples[lp][sys].append(auto_sample)
+                    errors.append(
+                        Error(
+                            span=error_span,
+                            category="",
+                            severity=severity,
+                            start=start_i,
+                            end=end_i,
+                            is_source_error=False,
+                            score=assign_score_based_on_severity(severity),
+                            explanation="",
+                            extended_span=None,
+                        )
+                    )
 
-                        assigned += 1
+                evaluation = AutomaticEvaluation(
+                    score=sum(error.score for error in errors),
+                    errors=errors,
+                    annotation="",
+                    parsing_error=False,
+                )
 
-                assert assigned == 1
+                auto_sample.human_evaluation = None
+                auto_sample.evaluation = evaluation
 
-    logger.info(
-        f"Num errors whose position was impossible to fix: {num_errors_impossible_to_find}/{num_total_errors}"
-    )
+                auto_lp2sys2samples[lp][sys].append(auto_sample)
 
     return auto_lp2sys2samples
 
@@ -295,10 +323,169 @@ def get_wmt25_esa_rater_data_from_raw_jsonl(
             sample2 = Sample.from_dict(sample1.to_dict())
             sample2.human_eval = human_2_eval
 
-            rater2lp2sys2samples["Human-1"][lp][sys].append(sample1)
-            rater2lp2sys2samples["Human-2"][lp][sys].append(sample2)
+            rater2lp2sys2samples["esa.human.1"][lp][sys].append(sample1)
+            rater2lp2sys2samples["esa.human.2"][lp][sys].append(sample2)
 
     return rater2lp2sys2samples
+
+
+def map_to_list_of_samples_and_sanity_check(
+    json_human_1: Dict,
+    json_human_2: Dict,
+) -> Tuple[List[Dict], List[Dict]]:
+    keys1 = list(json_human_1.keys())
+    keys2 = list(json_human_2.keys())
+    assert keys1 == keys2, f"keys1={keys1} != keys2={keys2}!"
+    keys = keys1
+
+    # the data is index with keys such as "gold_errors" and similar as the outer keys, while inner keys are sample keys such as "0", "1", "2", ...
+    # This function just puts samples as the outer elements (a list of samples), and then keys are the previous outer keys (e.g., 'gold_errors' per sample)
+    def create_sample_key_to_eval_mapping(json_data: Dict) -> List[Dict[str, Dict]]:
+        # sample keys are the strings used to index samples (e.g., "0", "1", "2", ...)
+        sample_keys = json_data[keys[0]].keys()
+        samples = []
+        for sample_key in sample_keys:
+            sample = {}
+            for field_key, values in json_data.items():
+                sample[field_key] = values[sample_key]
+            samples.append(sample)
+        return samples
+
+    samples_human_1 = create_sample_key_to_eval_mapping(json_human_1)
+    samples_human_2 = create_sample_key_to_eval_mapping(json_human_2)
+
+    for sample1, sample2 in zip(samples_human_1, samples_human_2):
+        assert (
+            sample1["doc_id"] == sample2["doc_id"]
+        ), f"sample1['doc_id']={sample1['doc_id']} != sample2['doc_id']={sample2['doc_id']}!"
+        assert (
+            sample1["segment_id"] == sample2["segment_id"]
+        ), f"sample1['segment_id']={sample1['segment_id']} != sample2['segment_id']={sample2['segment_id']}!"
+        assert (
+            sample1["system_id"] == sample2["system_id"]
+        ), f"sample1['system_id']={sample1['system_id']} != sample2['system_id']={sample2['system_id']}!"
+
+    return samples_human_1, samples_human_2
+
+
+def get_wmt25_esa_human1_and_2_data_from_raw_json(
+    samples: List[Dict],
+    lps: List[str],
+) -> Dict[str, Dict[str, List[Sample]]]:
+    """Load WMT25 MQM rater data from raw JSON file."""
+
+    # for now, let's just construct the human evaluations using human_1
+    num_tgt_mismatches = 0
+    lp2sys2samples = defaultdict(lambda: defaultdict(list))
+    for sample in samples:
+        set_id = sample["set_id"]
+        if set_id != "official":
+            continue
+
+        src_lang = lang_code2lang[sample["source_lang"]]
+        tgt_lang = lang_code2lang[sample["target_lang"]]
+        src = sample["source_segment"]
+        tgt = sample["hypothesis_segment"]
+        tgt_annotated = sample["hypothesis_annotated"]
+        doc_id = sample["doc_id"]
+        seg_id = int(sample["segment_id"])
+        method = sample["method"]
+        lp = doc_id.split("_#_")[0]
+
+        if "esa" not in method.lower():
+            continue
+
+        if tgt != tgt_annotated:
+            logger.debug(
+                "sample.tgt != sample.tgt_annotated, potential mismatches in annotations!"
+            )
+            num_tgt_mismatches += 1
+
+        if lp not in lps:
+            continue
+
+        errors = []
+
+        start_indices = (
+            sample["start_indices_gold"].split()
+            if sample["start_indices_gold"] != "-1"
+            else []
+        )
+        end_indices = (
+            sample["end_indices_gold"].split()
+            if sample["end_indices_gold"] != "-1"
+            else []
+        )
+        error_severities = (
+            sample["error_types_gold"].split()
+            if sample["error_types_gold"] != "no-error"
+            else []
+        )
+
+        assert (
+            len(error_severities)
+            == len(sample["mapped_errors"])
+            == len(start_indices)
+            == len(end_indices)
+        ), (
+            f"len(error_severities)={len(error_severities)} != "
+            f"len(sample['mapped_errors'])={len(sample['mapped_errors'])} != "
+            f"len(start_indices)={len(start_indices)} != "
+            f"len(end_indices)={len(end_indices)}"
+        )
+
+        if len(start_indices) == 0:
+            assert (
+                sample["error_types_gold"] == "no-error"
+            ), f"sample has no start/end indices but error_types_gold={sample['error_types_gold']} != 'no-error'!"
+
+        for start, end, severity in zip(start_indices, end_indices, error_severities):
+            if start is None or end is None or start == "missing" or end == "missing":
+                continue
+
+            start = int(start)
+            end = int(end)
+
+            is_source_error = False
+            error_span = src[start:end] if is_source_error else tgt[start:end]
+
+            errors.append(
+                Error(
+                    span=error_span,
+                    category="",
+                    severity=severity,
+                    start=start,
+                    end=end,
+                    is_source_error=is_source_error,
+                    score=assign_score_based_on_severity(
+                        severity
+                    ),  # There is no score in the esa files that I got from sweta, so I'm using MQM weighting just to have a score there
+                )
+            )
+
+        human_evaluation = HumanEvaluation(
+            score=sum(error.score for error in errors),
+            errors=errors,
+        )
+        lp2sys2samples[lp][sample["system_id"]].append(
+            Sample(
+                src=src,
+                tgt=tgt,
+                src_lang=src_lang,
+                tgt_lang=tgt_lang,
+                evaluation=None,
+                human_evaluation=human_evaluation,
+                doc_id=doc_id,
+                seg_id=seg_id,
+                tgt_annotated=tgt_annotated,
+            )
+        )
+
+    logger.info(
+        f"The number of target mismatches are: {num_tgt_mismatches}/{len(samples)}"
+    )
+
+    return lp2sys2samples
 
 
 def get_wmt25_mqm_rater_lp_data_from_raw_json(
@@ -491,6 +678,7 @@ def get_raters_evaluations(
     test_set: str,
     lps: list[str],
     use_merged_annotations: bool = False,
+    annotation_protocol: str = "mqm",
 ) -> Dict[str, Dict[str, Dict[str, List[Sample]]]]:
     """
     Load WMT evaluation data from all individual raters.
@@ -508,101 +696,150 @@ def get_raters_evaluations(
     )
 
     if test_set == "wmt25":
-        mqm_lps = [lp for lp in lps if lp in wmt25_lps_mqm]
-        for lp in mqm_lps:
-            json_path = Path(f"data/wmt25/data/mqm_generalMT2025_{lp}_with_errors.json")
-            rater2lp2sys2samples["mqm.super.1"][lp] = (
-                get_wmt25_mqm_rater_lp_data_from_raw_json(json_path)
-            )
-        return rater2lp2sys2samples
-
-    for lp in lps:
-        evalset = mt_metrics_eval_data.EvalSet(
-            test_set, lp, read_stored_metric_scores=True, read_stored_ratings=True
-        )
-
-        src_lang = lang_code2lang.get(evalset.src_lang)
-        tgt_lang = lang_code2lang.get(evalset.tgt_lang)
-
-        if src_lang is None or tgt_lang is None:
-            raise ValueError(
-                f"Language code not found: {evalset.src_lang} or {evalset.tgt_lang}"
-            )
-
-        if use_merged_annotations:
-            raters = [rater for rater in evalset._ratings.keys() if "merged" in rater]
-            if len(raters) == 0:
-                logger.warning(
-                    f"No merged raters for test set {test_set} and lp {lp}. "
-                    "Defaulting to individual raters."
+        if annotation_protocol == "mqm":
+            mqm_lps = [lp for lp in lps if lp in wmt25_lps_mqm]
+            for lp in mqm_lps:
+                json_path = Path(
+                    f"data/wmt25/data/mqm_generalMT2025_{lp}_with_errors.json"
                 )
+                rater2lp2sys2samples["mqm.super.1"][lp] = (
+                    get_wmt25_mqm_rater_lp_data_from_raw_json(json_path)
+                )
+        elif annotation_protocol == "esa":
+            esa_lps = [lp for lp in lps if lp in wmt25_lps_esa]
+
+            # NOTE: this code loads the data from Sweta's task2 files. However, it seems it is not possible to get which samples were manually evaluated and which, instead, had 0 errors.
+            json_path_human_1 = Path(
+                f"data/wmt25/data/task2_with_human_annotations_unique_errors_human1.json"
+            )
+            json_path_human_2 = Path(
+                f"data/wmt25/data/task2_with_human_annotations_unique_errors_human2.json"
+            )
+            with (
+                open(json_path_human_1, "r", encoding="utf-8") as f1,
+                open(json_path_human_2, "r", encoding="utf-8") as f2,
+            ):
+                human_1_data = json.load(f1)
+                human_2_data = json.load(f2)
+
+                samples_human_1, samples_human_2 = (
+                    map_to_list_of_samples_and_sanity_check(human_1_data, human_2_data)
+                )
+
+                rater2lp2sys2samples["esa.human.1"] = (
+                    get_wmt25_esa_human1_and_2_data_from_raw_json(
+                        samples_human_1, esa_lps
+                    )
+                )
+                rater2lp2sys2samples["esa.human.2"] = (
+                    get_wmt25_esa_human1_and_2_data_from_raw_json(
+                        samples_human_2, esa_lps
+                    )
+                )
+
+            """
+            # NOTE: This code instead uses the data from here: https://github.com/wmt-conference/wmt25-general-mt/blob/main/data/wmt25-genmt-humeval.jsonl
+            #   However, also in this case there are problems: the metrics shared task reset the segment_ids, creating global segment ids (while the ones from genMT start from zero for each new doc_id). As a consequence, it is not possible to match the samples in the test set with those from the submissions.
+            jsonl_path_esa = Path(f"data/wmt25/data/wmt25-genmt-humeval.jsonl")
+            rater2lp2sys2samples = get_wmt25_esa_rater_data_from_raw_jsonl(
+                jsonl_path_esa, esa_lps
+            )
+            """
+        else:
+            raise ValueError(f"Unknown annotation protocol: {annotation_protocol}")
+
+    else:
+        for lp in lps:
+            evalset = mt_metrics_eval_data.EvalSet(
+                test_set, lp, read_stored_metric_scores=True, read_stored_ratings=True
+            )
+
+            src_lang = lang_code2lang.get(evalset.src_lang)
+            tgt_lang = lang_code2lang.get(evalset.tgt_lang)
+
+            if src_lang is None or tgt_lang is None:
+                raise ValueError(
+                    f"Language code not found: {evalset.src_lang} or {evalset.tgt_lang}"
+                )
+
+            if use_merged_annotations:
+                raters = [
+                    rater for rater in evalset._ratings.keys() if "merged" in rater
+                ]
+                if len(raters) == 0:
+                    logger.warning(
+                        f"No merged raters for test set {test_set} and lp {lp}. "
+                        "Defaulting to individual raters."
+                    )
+                    raters = [
+                        rater
+                        for rater in evalset._ratings.keys()
+                        if "merged" not in rater
+                    ]
+            else:
                 raters = [
                     rater for rater in evalset._ratings.keys() if "merged" not in rater
                 ]
-        else:
-            raters = [
-                rater for rater in evalset._ratings.keys() if "merged" not in rater
-            ]
 
-        logger.info(
-            f"Test set={test_set}, lp={lp}, raters={raters}, "
-            f"use_merged_annotations={use_merged_annotations}"
-        )
+            logger.info(
+                f"Test set={test_set}, lp={lp}, raters={raters}, "
+                f"use_merged_annotations={use_merged_annotations}"
+            )
 
-        systems = evalset.sys_outputs.keys()
-        srcs = evalset.src
+            systems = evalset.sys_outputs.keys()
+            srcs = evalset.src
 
-        for rater in raters:
-            for sys in systems:
-                tgts = evalset.sys_outputs[sys]
-                mqm_ratings = evalset.Ratings(rater)[sys]
-                docs_per_seg = evalset.DocsPerSeg()
+            for rater in raters:
+                for sys in systems:
+                    tgts = evalset.sys_outputs[sys]
+                    mqm_ratings = evalset.Ratings(rater)[sys]
+                    docs_per_seg = evalset.DocsPerSeg()
 
-                assert (
-                    len(srcs) == len(tgts) == len(mqm_ratings) == len(docs_per_seg)
-                ), (
-                    f"len(srcs) = {len(srcs)} != len(tgts) = {len(tgts)} != "
-                    f"len(mqm_ratings) = {len(mqm_ratings)} != "
-                    f"len(docs_per_seg) = {len(docs_per_seg)}"
-                )
-
-                for seg_id, (src, tgt, mqm_rating, doc_id) in enumerate(
-                    zip(srcs, tgts, mqm_ratings, docs_per_seg)
-                ):
-                    human_evaluation = None
-                    if mqm_rating is not None:
-                        errors = []
-                        for error in mqm_rating.errors:
-                            error_span = (
-                                src[error.start : error.end]
-                                if error.is_source_error
-                                else tgt[error.start : error.end]
-                            )
-
-                            errors.append(
-                                Error(
-                                    span=error_span,
-                                    category=error.category,
-                                    severity=error.severity,
-                                    start=error.start,
-                                    end=error.end,
-                                    score=-error.score,
-                                    is_source_error=error.is_source_error,
-                                )
-                            )
-
-                        human_evaluation = HumanEvaluation(
-                            score=sum(error.score for error in errors),
-                            errors=errors,
-                            rater=rater,
-                        )
-
-                    sample = Sample(
-                        src, tgt, src_lang, tgt_lang, doc_id=doc_id, seg_id=seg_id
+                    assert (
+                        len(srcs) == len(tgts) == len(mqm_ratings) == len(docs_per_seg)
+                    ), (
+                        f"len(srcs) = {len(srcs)} != len(tgts) = {len(tgts)} != "
+                        f"len(mqm_ratings) = {len(mqm_ratings)} != "
+                        f"len(docs_per_seg) = {len(docs_per_seg)}"
                     )
-                    sample.human_evaluation = human_evaluation
 
-                    rater2lp2sys2samples[rater][lp][sys].append(sample)
+                    for seg_id, (src, tgt, mqm_rating, doc_id) in enumerate(
+                        zip(srcs, tgts, mqm_ratings, docs_per_seg)
+                    ):
+                        human_evaluation = None
+                        if mqm_rating is not None:
+                            errors = []
+                            for error in mqm_rating.errors:
+                                error_span = (
+                                    src[error.start : error.end]
+                                    if error.is_source_error
+                                    else tgt[error.start : error.end]
+                                )
+
+                                errors.append(
+                                    Error(
+                                        span=error_span,
+                                        category=error.category,
+                                        severity=error.severity,
+                                        start=error.start,
+                                        end=error.end,
+                                        score=-error.score,
+                                        is_source_error=error.is_source_error,
+                                    )
+                                )
+
+                            human_evaluation = HumanEvaluation(
+                                score=sum(error.score for error in errors),
+                                errors=errors,
+                                rater=rater,
+                            )
+
+                        sample = Sample(
+                            src, tgt, src_lang, tgt_lang, doc_id=doc_id, seg_id=seg_id
+                        )
+                        sample.human_evaluation = human_evaluation
+
+                        rater2lp2sys2samples[rater][lp][sys].append(sample)
 
     return rater2lp2sys2samples
 
