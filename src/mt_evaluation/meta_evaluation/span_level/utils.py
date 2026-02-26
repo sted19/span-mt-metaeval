@@ -1056,3 +1056,41 @@ def compute_results_from_metrics(
                         )
 
     return results
+
+
+def macro_average_results_across_lps(
+    results: Dict[str, Dict[str, Dict[str, Dict[str, MetricResults]]]],
+    lp_key: str,
+) -> Dict[str, Dict[str, Dict[str, Dict[str, MetricResults]]]]:
+    global_results = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(MetricResults)))
+    )
+    lps = list(results.keys())
+    aggregation_strategies = next(iter(results.values())).keys()
+    matching_strategies = next(iter(next(iter(results.values())).values())).keys()
+    autoevals = next(
+        iter(next(iter(next(iter(results.values())).values())).values())
+    ).keys()
+    metric_types = next(
+        iter(
+            next(
+                iter(next(iter(next(iter(results.values())).values())).values())
+            ).values()
+        )
+    ).results.keys()
+
+    for aggr in aggregation_strategies:
+        for match in matching_strategies:
+            for autoeval in autoevals:
+                for metric_type in metric_types:
+                    for lp in lps:
+                        lp_res = results[lp][aggr][match][autoeval].get(metric_type)
+                        p, r, f1 = lp_res.precision, lp_res.recall, lp_res.f1
+                        global_results[lp_key][aggr][match][autoeval].update(
+                            metric_type, p, r, f1
+                        )
+                    global_results[lp_key][aggr][match][autoeval].average(
+                        metric_type, len(lps)
+                    )
+
+    return global_results

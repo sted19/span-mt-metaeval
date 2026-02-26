@@ -57,6 +57,7 @@ from mt_evaluation.meta_evaluation.span_level.utils import (
     aggregate_metrics,
     compute_results_from_metrics,
     process_single_autoeval_wrapper,
+    macro_average_results_across_lps,
 )
 from mt_evaluation.meta_evaluation.span_level.perturbations import (
     extract_perturbations_from_autoevals,
@@ -582,12 +583,18 @@ def main():
             sentinel_counts,
         )
 
+    # Here, we aggregate stats across language pairs and compute global results
     global_key = "global"
+    if args.micro_average_across_lps:
+        global_metrics: Dict[
+            str, Dict[str, Dict[str, Dict[str, Dict[str, Metrics]]]]
+        ] = aggregate_metrics(metrics, global_key)
+        global_results = compute_results_from_metrics(global_metrics)
+    # Here, we compute global results by averaging results across language pairs (i.e., macro-averaging)
+    else:
+        global_results = macro_average_results_across_lps(results, global_key)
+
     global_stats: Dict[str, MetricStats] = aggregate_stats(metrics_stats)
-    global_metrics: Dict[str, Dict[str, Dict[str, Dict[str, Dict[str, Metrics]]]]] = (
-        aggregate_metrics(metrics, global_key)
-    )
-    global_results = compute_results_from_metrics(global_metrics)
     global_counts_sentinels = compute_sentinel_counts(global_results[global_key])
 
     print_results_and_stats(
@@ -734,6 +741,11 @@ def read_arguments() -> argparse.ArgumentParser:
         "--use-greedy-matching",
         action="store_true",
         help="Whether to use greedy matching instead of optimal matching when computing the metrics.",
+    )
+    parser.add_argument(
+        "--micro-average-across-lps",
+        action="store_true",
+        help="Whether to compute global results by micro-averaging metrics across language pairs instead of macro-averaging results across language pairs.",
     )
 
     return parser

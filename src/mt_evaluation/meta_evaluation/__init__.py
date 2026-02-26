@@ -55,6 +55,7 @@ class SeverityCounts:
         major: Count of major severity errors.
         critical: Count of critical severity errors.
     """
+
     neutral: int = 0
     minor: int = 0
     major: int = 0
@@ -92,6 +93,7 @@ class MetricStats:
     Tracks various counts and statistics during the evaluation of metrics,
     including error counts, sample counts, and severity breakdowns.
     """
+
     num_samples: int = 0
     num_errors: int = 0
     num_samples_with_no_errors: int = 0
@@ -164,6 +166,7 @@ class MetricStats:
 @dataclass
 class TypeMetricResults:
     """Results for a specific metric type (precision, recall, F1)."""
+
     precision: float = 0
     recall: float = 0
     f1: float = 0
@@ -183,13 +186,16 @@ class MetricResults:
     Stores precision/recall/F1 results for each metric type (Exact Match,
     Partial Overlap, Character Counts, Character Proportion).
     """
+
     results: Dict[str, TypeMetricResults] = field(
         default_factory=lambda: {
             metric_type: TypeMetricResults() for metric_type in METRIC_TYPES
         }
     )
 
-    def update(self, metric_type: str, precision: float, recall: float, f1: float) -> None:
+    def update(
+        self, metric_type: str, precision: float, recall: float, f1: float
+    ) -> None:
         """Update results for a specific metric type."""
         self.results[metric_type].update(precision, recall, f1)
 
@@ -197,10 +203,26 @@ class MetricResults:
         """Get results for a specific metric type."""
         return self.results[metric_type]
 
+    def average(self, metric_type: str, num_samples: int):
+        """Average results for a specific metric type by number of samples."""
+        if num_samples == 0:
+            raise ValueError(
+                "Number of samples must be greater than 0 to compute average."
+            )
+
+        new_results = TypeMetricResults(
+            precision=self.results[metric_type].precision / num_samples,
+            recall=self.results[metric_type].recall / num_samples,
+            f1=self.results[metric_type].f1 / num_samples,
+        )
+
+        self.results[metric_type] = new_results
+
 
 @dataclass
 class TypeSentinelCounts:
     """Sentinel experiment counts for a specific metric type."""
+
     num_ext_only_greater_than_normal: int = 0
     num_ext_only_smaller_or_equal_than_normal: int = 0
     num_no_ext_greater_than_normal: int = 0
@@ -242,6 +264,7 @@ class SentinelCounts:
     Used to track results of sentinel experiments that help evaluate
     the reliability of span-level metrics.
     """
+
     counts: Dict[str, TypeSentinelCounts] = field(
         default_factory=lambda: {
             metric_type: TypeSentinelCounts() for metric_type in METRIC_TYPES
