@@ -3,7 +3,9 @@
 
 from typing import Literal, Dict, List, Tuple, Callable
 from dataclasses import asdict
+import csv
 import logging
+from pathlib import Path
 from tabulate import tabulate
 from collections import defaultdict
 
@@ -15,17 +17,16 @@ from mt_metrics_eval import (
 from mt_evaluation.meta_evaluation import (
     wmt23_lps,
     wmt24_lps,
-    UNKNOWN_SEVERITY,
     MetricResults,
     MetricStats,
     SentinelCounts,
     METRIC_TYPES,
 )
+
+from mt_evaluation.data import MTEvaluationCache, lang_code2lang, get_cache_dir
 from mt_evaluation.meta_evaluation.span_level.perturbations import (
-    PERTURBATION_EXT_ONLY,
     PERTURBATION_REMOVE_ERRORS_IN_SAMPLES_WITH_1,
 )
-from mt_evaluation.data import MTEvaluationCache, lang_code2lang, get_cache_dir
 from mt_evaluation.utils import get_metric_display_name
 from mt_evaluation.core import Sample
 from mt_evaluation.utils import is_all_nones
@@ -379,6 +380,39 @@ def get_autoeval2scores(
     return autoeval2lp_scores
 
 
+def aggregate_metadata(
+    metadata: Dict[str, Dict[str, Dict[str, int]]],
+    lp_key: str,
+) -> Dict[str, Dict[str, Dict[str, int]]]:
+    """
+    Aggregate the metadata across language pairs.
+
+    Args:
+        metadata: dictionary from language pairs to another dictionary of the form {metric name: {metadata name: metadata value}}
+        lp_key: the key of the dictionary where to save global metadata
+
+    Returns:
+        A dictionary of the form {metric name: {metadata name: aggregated metadata value}}
+    """
+    autoevals = list(metadata.keys())
+    lps = list(next(iter(metadata.values())).keys())
+
+    for autoeval in autoevals:
+        for lp in lps:
+            autoeval_metadata = metadata.get(autoeval, {}).get(lp, {})
+            if not autoeval_metadata:
+                continue
+
+            global_metadata = metadata[autoeval][lp_key]
+            for metadata_name, metadata_value in autoeval_metadata.items():
+                if metadata_name in global_metadata:
+                    global_metadata[metadata_name] += metadata_value
+                else:
+                    global_metadata[metadata_name] = metadata_value
+
+    return metadata
+
+
 def aggregate_stats(
     metrics_stats: Dict[str, Dict[str, MetricStats]],
 ) -> Dict[str, MetricStats]:
@@ -399,119 +433,6 @@ def aggregate_stats(
             global_stats[metric_name].update(**asdict(metric_stats))
 
     return global_stats
-
-
-def determine_perturbation_type(metric_name: str) -> Tuple[bool, bool, bool, bool]:
-    normal, ext_only, no_ext, remove_all = False, False, False, False
-    if metric_name.endswith(PERTURBATION_EXT_ONLY):
-        ext_only = True
-    elif metric_name.endswith(PERTURBATION_REMOVE_ERRORS_IN_SAMPLES_WITH_1):
-        remove_all = True
-    else:
-        normal = True
-
-    return normal, ext_only, no_ext, remove_all
-
-
-def compute_sentinel_counts(
-    metrics_results: Dict[str, Dict[str, Dict[str, MetricResults]]],
-) -> Dict[str, Dict[str, SentinelCounts]]:
-
-    sentinel_counts = defaultdict(lambda: defaultdict(SentinelCounts))
-
-    for aggr_type, match_type2metric_results in metrics_results.items():
-        for match_type, results in match_type2metric_results.items():
-            for metric_type in METRIC_TYPES:
-
-                num_ext_only_greater_than_normal: int = 0
-                num_ext_only_smaller_or_equal_than_normal: int = 0
-                num_no_ext_greater_than_normal: int = 0
-                num_no_ext_smaller_or_equal_than_normal: int = 0
-                num_remove_all_1_greater_than_normal: int = 0
-                num_remove_all_1_smaller_or_equal_than_normal: int = 0
-
-                for i, (metric_name_i, metric_results_i) in enumerate(
-                    list(results.items())[:-1]
-                ):
-                    for j, (metric_name_j, metric_results_j) in enumerate(
-                        list(results.items())[i + 1 :]
-                    ):
-
-                        # I'm only interested in comparing normal variants with sentinels of THE SAME auto-evaluator. So, the metric names should match
-                        if not metric_name_i.startswith(
-                            metric_name_j
-                        ) and not metric_name_j.startswith(metric_name_i):
-                            continue
-
-                        normal_i, ext_only_i, no_ext_i, remove_all_i = (
-                            determine_perturbation_type(metric_name_i)
-                        )
-                        normal_j, ext_only_j, no_ext_j, remove_all_j = (
-                            determine_perturbation_type(metric_name_j)
-                        )
-
-                        if normal_i and ext_only_j:
-                            if (
-                                metric_results_j.results[metric_type].f1
-                                > metric_results_i.results[metric_type].f1
-                            ):
-                                num_ext_only_greater_than_normal += 1
-                            else:
-                                num_ext_only_smaller_or_equal_than_normal += 1
-                        elif normal_j and ext_only_i:
-                            if (
-                                metric_results_i.results[metric_type].f1
-                                > metric_results_j.results[metric_type].f1
-                            ):
-                                num_ext_only_greater_than_normal += 1
-                            else:
-                                num_ext_only_smaller_or_equal_than_normal += 1
-                        if normal_i and no_ext_j:
-                            if (
-                                metric_results_j.results[metric_type].f1
-                                > metric_results_i.results[metric_type].f1
-                            ):
-                                num_no_ext_greater_than_normal += 1
-                            else:
-                                num_no_ext_smaller_or_equal_than_normal += 1
-                        elif normal_j and no_ext_i:
-                            if (
-                                metric_results_i.results[metric_type].f1
-                                > metric_results_j.results[metric_type].f1
-                            ):
-                                num_no_ext_greater_than_normal += 1
-                            else:
-                                num_no_ext_smaller_or_equal_than_normal += 1
-                        elif normal_i and remove_all_j:
-                            if (
-                                metric_results_j.results[metric_type].f1
-                                > metric_results_i.results[metric_type].f1
-                            ):
-                                num_remove_all_1_greater_than_normal += 1
-                            else:
-                                num_remove_all_1_smaller_or_equal_than_normal += 1
-                        elif normal_j and remove_all_i:
-                            if (
-                                metric_results_i.results[metric_type].f1
-                                > metric_results_j.results[metric_type].f1
-                            ):
-                                num_remove_all_1_greater_than_normal += 1
-                            else:
-                                num_remove_all_1_smaller_or_equal_than_normal += 1
-                        else:
-                            pass
-
-                sentinel_counts[aggr_type][match_type].update(
-                    metric_type,
-                    num_ext_only_greater_than_normal,
-                    num_ext_only_smaller_or_equal_than_normal,
-                    num_no_ext_greater_than_normal,
-                    num_no_ext_smaller_or_equal_than_normal,
-                    num_remove_all_1_greater_than_normal,
-                    num_remove_all_1_smaller_or_equal_than_normal,
-                )
-
-    return sentinel_counts
 
 
 def print_results(
@@ -762,7 +683,6 @@ def print_results_and_stats(
     lp: str,
     metrics_results: Dict[str, Dict[str, Dict[str, MetricResults]]],
     metrics_stats: Dict[str, MetricStats],
-    sentinel_counts: Dict[str, Dict[str, SentinelCounts]],
 ):
 
     metrics_results_matching: Dict[str, MetricResults] = metrics_results["micro"][
@@ -788,5 +708,158 @@ def print_results_and_stats(
         metrics_results_matching_macro,
         metrics_results_no_matching_macro,
     )
-    print_sentinel_counts(sentinel_counts)
     print_stats(metrics_stats)
+
+
+def _sanitize_metric_type_for_filename(metric_type: str) -> str:
+    """Convert a METRIC_TYPES name (e.g. 'Exact\nMatch') into a filesystem-safe
+    lowercase_underscore form (e.g. 'exact_match')."""
+    return metric_type.replace("\n", "_").lower()
+
+
+def _get_sorted_autoeval_names(
+    metrics_results_micro_matching: Dict[str, MetricResults],
+) -> List[str]:
+    """Return autoeval names sorted by F1 on Character Proportion (micro/matching),
+    matching the order used by print_results."""
+    return [
+        name
+        for name, _ in sorted(
+            metrics_results_micro_matching.items(),
+            key=lambda x: x[1].results["Character\nProportion"].f1,
+            reverse=True,
+        )
+    ]
+
+
+def save_results_to_tsv(
+    lp: str,
+    metrics_results: Dict[str, Dict[str, Dict[str, MetricResults]]],
+    metrics_stats: Dict[str, MetricStats],
+    output_dir: Path,
+    perturbations_metadata: Dict[str, Dict[str, Dict[str, int]]],
+) -> None:
+    """Write per-(aggregation, matching, metric_type) result TSV files and a
+    stats TSV into ``output_dir / lp /``.
+
+    Directory layout produced (per language pair)::
+
+        {output_dir}/{lp}/micro_matching_exact_match.tsv
+        {output_dir}/{lp}/micro_matching_partial_overlap.tsv
+        …
+        {output_dir}/{lp}/macro_not_matching_character_proportion.tsv
+        {output_dir}/{lp}/stats.tsv
+    """
+    lp_dir = output_dir / lp
+    lp_dir.mkdir(parents=True, exist_ok=True)
+
+    metrics_results_micro_matching = metrics_results.get("micro", {}).get(
+        "matching", {}
+    )
+    if not metrics_results_micro_matching:
+        logger.warning(f"No micro/matching results for '{lp}' – skipping TSV export.")
+        return
+
+    sorted_names = _get_sorted_autoeval_names(metrics_results_micro_matching)
+
+    # ------------------------------------------------------------------
+    # Result TSV files: one per (aggr, matching, metric_type) combination
+    # ------------------------------------------------------------------
+    for aggr_type in ("micro", "macro"):
+        for match_type in ("matching", "not_matching"):
+            results_for_combo: Dict[str, MetricResults] = metrics_results.get(
+                aggr_type, {}
+            ).get(match_type, {})
+            if not results_for_combo:
+                continue
+
+            for metric_type in METRIC_TYPES:
+                safe_mt = _sanitize_metric_type_for_filename(metric_type)
+                filename = f"{aggr_type}_{match_type}_{safe_mt}.tsv"
+                filepath = lp_dir / filename
+
+                with open(filepath, "w", newline="") as fh:
+                    writer = csv.writer(fh, delimiter="\t")
+                    writer.writerow(["Metric", "Precision", "Recall", "F1"])
+
+                    for name in sorted_names:
+
+                        tsv_name = name
+                        if PERTURBATION_REMOVE_ERRORS_IN_SAMPLES_WITH_1 in name:
+                            metadata = perturbations_metadata[name][lp]
+                            num_errors_before_removal = metadata[
+                                "num_errors_before_removal"
+                            ]
+                            num_errors_removed = metadata["num_errors_removed"]
+                            tsv_name = f"{name}_{num_errors_before_removal}_{num_errors_removed}"
+
+                        mr = results_for_combo.get(name)
+                        if mr is None:
+                            continue
+                        tmr = mr.results[metric_type]
+                        writer.writerow(
+                            [
+                                tsv_name,
+                                f"{100 * tmr.precision:.2f}",
+                                f"{100 * tmr.recall:.2f}",
+                                f"{100 * tmr.f1:.2f}",
+                            ]
+                        )
+
+    # ------------------------------------------------------------------
+    # Stats TSV
+    # ------------------------------------------------------------------
+    if metrics_stats:
+        stats_path = lp_dir / "stats.tsv"
+        stats_headers = [
+            "Metric",
+            "Total Detected Errors",
+            "Remaining Errors",
+            "Avg Errors per Sample",
+            "Avg Span Length (chars)",
+            "Ill Formed Errors",
+            "Ill Formed Extended Spans",
+            "Errors Ambiguous Match",
+            "Errors Ambiguous Match Extended",
+            "Overlapping Errors",
+            "Severity Filtered Errors",
+            "Category Filtered Errors",
+            "Score 0 Errors",
+            "Neutral (Orig/Final)",
+            "Minor (Orig/Final)",
+            "Major (Orig/Final)",
+            "Critical (Orig/Final)",
+            "Samples No Errors",
+            "Total Samples",
+        ]
+
+        with open(stats_path, "w", newline="") as fh:
+            writer = csv.writer(fh, delimiter="\t")
+            writer.writerow(stats_headers)
+
+            for metric_name, ms in metrics_stats.items():
+                writer.writerow(
+                    [
+                        metric_name,
+                        f"{ms.num_errors + ms.num_removed_errors}",
+                        f"{ms.num_errors}",
+                        f"{ms.avg_errors_per_sample:.2f}",
+                        f"{ms.avg_span_length:.1f}",
+                        f"{ms.num_ill_formed_errors}",
+                        f"{ms.num_ill_formed_extended_span}",
+                        f"{ms.num_errors_with_ambiguous_match}",
+                        f"{ms.num_errors_with_ambiguous_match_with_extended_span}",
+                        f"{ms.num_overlapping_errors}",
+                        f"{ms.num_severity_filtered_errors}",
+                        f"{ms.num_category_filtered_errors}",
+                        f"{ms.num_score_0_errors}",
+                        ms.severity_breakdown.get("neutral", "0 / 0"),
+                        ms.severity_breakdown.get("minor", "0 / 0"),
+                        ms.severity_breakdown.get("major", "0 / 0"),
+                        ms.severity_breakdown.get("critical", "0 / 0"),
+                        f"{ms.num_samples_with_no_errors} ({ms.num_samples_with_no_errors / ms.num_samples * 100:.1f}%)",
+                        f"{ms.num_samples}",
+                    ]
+                )
+
+    logger.info(f"TSV results for '{lp}' written to {lp_dir}")

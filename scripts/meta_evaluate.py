@@ -39,9 +39,10 @@ from mt_evaluation.meta_evaluation.metrics_to_evaluate import (
 from mt_evaluation.utils import setup_logging, convert_defaultdict_to_dict
 from mt_evaluation.meta_evaluation.utils import (
     aggregate_stats,
+    aggregate_metadata,
     print_results_and_stats,
+    save_results_to_tsv,
     remove_samples_with_none_human_evaluation,
-    compute_sentinel_counts,
 )
 from mt_evaluation.meta_evaluation.span_level.preprocessing import (
     count_errors_by_severity,
@@ -480,20 +481,19 @@ def main():
                 lp2preprocessed_samples_with_automatic_evaluations
             )
 
-    autoeval2lp2preprocessed_samples_with_automatic_evaluations = (
-        extract_perturbations_from_autoevals(
-            autoeval2lp2preprocessed_samples_with_automatic_evaluations,
-            enabled_perturbations=enabled_perturbations,
-        )
+    (
+        autoeval2lp2preprocessed_samples_with_automatic_evaluations,
+        autoeval2lp2perturbations_metadata,
+    ) = extract_perturbations_from_autoevals(
+        autoeval2lp2preprocessed_samples_with_automatic_evaluations,
+        enabled_perturbations=enabled_perturbations,
     )
 
     for (
         autoeval,
         _lp2preprocessed_samples_with_automatic_evaluations,
     ) in autoeval2lp2preprocessed_samples_with_automatic_evaluations.items():
-        if not any(
-            autoeval.endswith(perturbation) for perturbation in enabled_perturbations
-        ):
+        if not any(perturbation in autoeval for perturbation in enabled_perturbations):
             continue
         for (
             lp,
@@ -573,14 +573,21 @@ def main():
 
     results = compute_results_from_metrics(metrics)
 
+    tsv_output_dir = Path(f"generated/tsv/{"-".join(test_sets)}/{annotation_protocol}")
+
     # Print tables for each language pair
     for lp in lps:
-        sentinel_counts = compute_sentinel_counts(results[lp])
-        print_results_and_stats(
+        # print_results_and_stats(
+        #     lp,
+        #     results[lp],
+        #     metrics_stats[lp],
+        # )
+        save_results_to_tsv(
             lp,
             results[lp],
             metrics_stats[lp],
-            sentinel_counts,
+            tsv_output_dir,
+            autoeval2lp2perturbations_metadata,
         )
 
     # Here, we aggregate stats across language pairs and compute global results
@@ -594,14 +601,22 @@ def main():
     else:
         global_results = macro_average_results_across_lps(results, global_key)
 
+    global_autoeval2lp2perturbations_metadata = aggregate_metadata(
+        autoeval2lp2perturbations_metadata, global_key
+    )
     global_stats: Dict[str, MetricStats] = aggregate_stats(metrics_stats)
-    global_counts_sentinels = compute_sentinel_counts(global_results[global_key])
 
-    print_results_and_stats(
+    # print_results_and_stats(
+    #     global_key,
+    #     global_results[global_key],
+    #     global_stats,
+    # )
+    save_results_to_tsv(
         global_key,
         global_results[global_key],
         global_stats,
-        global_counts_sentinels,
+        tsv_output_dir,
+        global_autoeval2lp2perturbations_metadata,
     )
 
 
@@ -714,7 +729,7 @@ def read_arguments() -> argparse.ArgumentParser:
         choices=list(ALL_PERTURBATIONS) + [[]],
         help=f"Perturbations to apply to evaluators. Valid values: {', '.join(ALL_PERTURBATIONS)}. "
         f"If not specified or empty list, no perturbations are generated. "
-        f"Example: --perturbations NO_EXT RAND_REMOVE_05",
+        f"Example: --perturbations EXT_ONLY RAND_REMOVE",
     )
 
     parser.add_argument(

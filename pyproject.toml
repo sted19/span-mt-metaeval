@@ -28,6 +28,8 @@ dependencies = [
     "pyyaml>=6.0.2",
     # Optimal bipartite matching (used in meta_evaluation/span_level/matching.py)
     "scipy>=1.14.0",
+    # Plotting (used in scripts/plot_progressive_span_length.py)
+    "matplotlib>=3.9.0",
 ]
 
 [project.optional-dependencies]
