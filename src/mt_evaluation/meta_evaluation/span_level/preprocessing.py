@@ -28,6 +28,36 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
+# Memory Optimization Helpers
+# =============================================================================
+
+
+def strip_heavy_fields_from_samples(samples: List[Sample]) -> None:
+    """Strip heavyweight fields from samples that are not needed during metric computation.
+
+    The ``annotation``, ``user_prompt``, ``system_prompt``, ``few_shots`` and ``cost``
+    fields on :class:`AutomaticEvaluation` are never accessed by the matching /
+    metric-computation code (which only uses ``errors``, ``src`` and ``tgt``).
+    Clearing them before perturbation expansion avoids copying kilobytes of
+    dead-weight strings into every perturbation variant.
+
+    This mutates the samples **in-place** and is not reversible.
+
+    Args:
+        samples: List of Sample objects to strip.
+    """
+    for sample in samples:
+        if sample.evaluation is not None:
+            sample.evaluation.annotation = ""
+            sample.evaluation.user_prompt = ""
+            sample.evaluation.system_prompt = ""
+            sample.evaluation.few_shots = None
+            sample.evaluation.cost = None
+        # Also strip the document context if present (only needed for LLM calls)
+        sample.src_doc = None
+
+
+# =============================================================================
 # Error Statistics Functions
 # =============================================================================
 

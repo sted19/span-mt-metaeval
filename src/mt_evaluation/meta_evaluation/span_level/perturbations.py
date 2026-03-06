@@ -168,6 +168,105 @@ def remove_spans_with_probability_p(
     return new_sample
 
 
+def extract_perturbations_for_single_autoeval(
+    autoeval: str,
+    lp2preprocessed_samples: Dict[str, List[Sample]],
+    enabled_perturbations: Set[str],
+) -> Tuple[Dict[str, Dict[str, List[Sample]]], Dict[str, Dict[str, Dict[str, int]]]]:
+    """
+    Extract perturbation variants for a single auto-evaluator.
+
+    Args:
+        autoeval: Name of the auto-evaluator.
+        lp2preprocessed_samples: Mapping from language pair to preprocessed samples for this autoeval.
+        enabled_perturbations: Set of perturbation types to generate.
+            Valid values: EXT_ONLY, RAND_REMOVE, REMOVE_ALL_1, PROGRESSIVE_LENGTH
+
+    Returns:
+        Tuple of:
+        - Dictionary mapping variant name -> lp -> list of samples (includes the original under ``autoeval``).
+        - Dictionary mapping variant name -> lp -> metadata dict.
+    """
+    perturbed_variants: Dict[str, Dict[str, List[Sample]]] = defaultdict(dict)
+    perturbed_metadata: Dict[str, Dict[str, Dict[str, int]]] = defaultdict(
+        lambda: defaultdict(dict)
+    )
+
+    do_ext_only = PERTURBATION_EXT_ONLY in enabled_perturbations
+    do_rand_remove = PERTURBATION_RAND_REMOVE in enabled_perturbations
+    do_samples_with_1 = (
+        PERTURBATION_REMOVE_ERRORS_IN_SAMPLES_WITH_1 in enabled_perturbations
+    )
+    progressive_length = PERTURBATION_PROGRESSIVE_LENGTH in enabled_perturbations
+
+    rng = np.random.default_rng(45)
+
+    for lp, samples in lp2preprocessed_samples.items():
+        # normal annotations (always included)
+        perturbed_variants[autoeval][lp] = samples
+
+        if autoeval not in autoevals_with_no_extended_spans:
+            # use extended span in the place of normal spans
+            if do_ext_only:
+                extended_span_only_samples = [
+                    switch_spans_for_extended_spans(sample) for sample in samples
+                ]
+                perturbed_variants[autoeval + "_EXT_ONLY"][lp] = (
+                    extended_span_only_samples
+                )
+
+        if do_samples_with_1:
+            res = [
+                remove_errors_from_samples_with_1_error(sample) for sample in samples
+            ]
+            samples_with_removed_errors = [r[0] for r in res]
+            num_errors_before_removal = sum([r[1] for r in res])
+            n_removed = sum(r[2] for r in res)
+            perturbed_variants[autoeval + "_REMOVE_ALL_1"][lp] = (
+                samples_with_removed_errors
+            )
+            perturbed_metadata[autoeval + "_REMOVE_ALL_1"][lp] = {
+                "num_errors_before_removal": num_errors_before_removal,
+                "num_errors_removed": n_removed,
+            }
+
+        if do_rand_remove:
+            total_errors = sum(len(sample.evaluation.errors) for sample in samples)
+            sampled_nums = rng.random(total_errors).tolist()
+
+            for pct in range(10, 100, 10):
+                p = pct / 100
+                rand_remove_samples = []
+                i = 0
+
+                for sample in samples:
+                    n_errs = len(sample.evaluation.errors)
+                    sample_numbers = sampled_nums[i : i + n_errs]
+                    rand_remove_samples.append(
+                        remove_spans_with_probability_p(
+                            sample,
+                            p,
+                            sample_numbers,
+                        )
+                    )
+                    i += n_errs
+
+                perturbed_variants[autoeval + f"_RAND_REMOVE_{pct}"][lp] = (
+                    rand_remove_samples
+                )
+
+        if progressive_length:
+            for n in range(10, 101, 10):
+                progressive_length_samples = [
+                    increase_spans_length_by_n(sample, n, lp) for sample in samples
+                ]
+                perturbed_variants[autoeval + f"_PROGRESSIVE_LENGTH_{n}"][lp] = (
+                    progressive_length_samples
+                )
+
+    return perturbed_variants, perturbed_metadata
+
+
 def extract_perturbations_from_autoevals(
     autoeval2lp2preprocessed_samples_with_automatic_evaluations: Dict[
         str, Dict[str, List[Sample]]
@@ -175,7 +274,12 @@ def extract_perturbations_from_autoevals(
     enabled_perturbations: Optional[Set[str]] = None,
 ) -> Tuple[Dict[str, Dict[str, List[Sample]]], Dict[str, Dict[str, Dict[str, int]]]]:
     """
-    Extract perturbations from auto-evaluations.
+    Extract perturbations from auto-evaluations (bulk version).
+
+    This is a convenience wrapper around :func:`extract_perturbations_for_single_autoeval`
+    that processes all auto-evaluators at once.  For memory-constrained scenarios,
+    prefer calling ``extract_perturbations_for_single_autoeval`` in a loop and
+    freeing each auto-evaluator's data after processing.
 
     Args:
         autoeval2lp2preprocessed_samples_with_automatic_evaluations: Dictionary of auto-evaluations
@@ -188,7 +292,10 @@ def extract_perturbations_from_autoevals(
     """
     # If no perturbations enabled, return the original data as-is
     if not enabled_perturbations:
-        return autoeval2lp2preprocessed_samples_with_automatic_evaluations
+        return (
+            autoeval2lp2preprocessed_samples_with_automatic_evaluations,
+            defaultdict(lambda: defaultdict(dict)),
+        )
 
     # Validate perturbation names
     invalid_perturbations = enabled_perturbations - ALL_PERTURBATIONS
@@ -198,114 +305,21 @@ def extract_perturbations_from_autoevals(
             f"Valid types are: {ALL_PERTURBATIONS}"
         )
 
-    perturbed_autoeval2lp2preprocessed_samples_with_automatic_evaluations = defaultdict(
-        lambda: dict()
+    all_perturbed: Dict[str, Dict[str, List[Sample]]] = {}
+    all_metadata: Dict[str, Dict[str, Dict[str, int]]] = defaultdict(
+        lambda: defaultdict(dict)
     )
-    perturbed_autoeval2lp2metadata = defaultdict(lambda: defaultdict(dict))
-
-    # Check which perturbations are enabled
-    do_ext_only = PERTURBATION_EXT_ONLY in enabled_perturbations
-    do_rand_remove = PERTURBATION_RAND_REMOVE in enabled_perturbations
-    do_samples_with_1 = (
-        PERTURBATION_REMOVE_ERRORS_IN_SAMPLES_WITH_1 in enabled_perturbations
-    )
-    progressive_length = PERTURBATION_PROGRESSIVE_LENGTH in enabled_perturbations
 
     for (
         autoeval,
         lp2preprocessed_samples,
     ) in autoeval2lp2preprocessed_samples_with_automatic_evaluations.items():
+        variants, metadata = extract_perturbations_for_single_autoeval(
+            autoeval, lp2preprocessed_samples, enabled_perturbations
+        )
+        all_perturbed.update(variants)
+        for variant_name, lp2meta in metadata.items():
+            for lp, meta in lp2meta.items():
+                all_metadata[variant_name][lp] = meta
 
-        rng = np.random.default_rng(45)
-
-        for lp, samples in lp2preprocessed_samples.items():
-            # normal annotations (always included)
-            perturbed_autoeval2lp2preprocessed_samples_with_automatic_evaluations[
-                autoeval
-            ][lp] = samples
-
-            if autoeval not in autoevals_with_no_extended_spans:
-                # Perturbation number 1. --> do not use extended span (this has been removed to use the new parallel processing more easily, as it was incompatible)
-                if False:
-                    no_extended_span_samples = [
-                        remove_extended_span_from_sample_errors(sample)
-                        for sample in samples
-                    ]
-                    perturbed_autoeval2lp2preprocessed_samples_with_automatic_evaluations[
-                        autoeval + "_NO_EXT"
-                    ][
-                        lp
-                    ] = no_extended_span_samples
-
-                # Perturbation number 2. --> use extended span in the place of normal spans
-                if do_ext_only:
-                    extended_span_only_samples = [
-                        switch_spans_for_extended_spans(sample) for sample in samples
-                    ]
-                    perturbed_autoeval2lp2preprocessed_samples_with_automatic_evaluations[
-                        autoeval + "_EXT_ONLY"
-                    ][
-                        lp
-                    ] = extended_span_only_samples
-
-            if do_samples_with_1:
-                res = [
-                    remove_errors_from_samples_with_1_error(sample)
-                    for sample in samples
-                ]
-                samples_with_removed_errors = [r[0] for r in res]
-                num_errors_before_removal = sum([r[1] for r in res])
-                n_removed = sum(r[2] for r in res)
-                perturbed_autoeval2lp2preprocessed_samples_with_automatic_evaluations[
-                    autoeval + f"_REMOVE_ALL_1"
-                ][lp] = samples_with_removed_errors
-
-                perturbed_autoeval2lp2metadata[autoeval + f"_REMOVE_ALL_1"][lp] = {
-                    "num_errors_before_removal": num_errors_before_removal,
-                    "num_errors_removed": n_removed,
-                }
-
-            if do_rand_remove:
-                total_errors = sum(len(sample.evaluation.errors) for sample in samples)
-                sampled_nums = rng.random(total_errors).tolist()
-
-                for pct in range(10, 100, 10):
-                    p = pct / 100
-                    rand_remove_samples = []
-                    i = 0
-
-                    for sample in samples:
-                        n_errs = len(sample.evaluation.errors)
-                        sample_numbers = sampled_nums[i : i + n_errs]
-                        rand_remove_samples.append(
-                            remove_spans_with_probability_p(
-                                sample,
-                                p,
-                                sample_numbers,
-                            )
-                        )
-                        i += n_errs
-
-                    perturbed_autoeval2lp2preprocessed_samples_with_automatic_evaluations[
-                        autoeval + f"_RAND_REMOVE_{pct}"
-                    ][
-                        lp
-                    ] = rand_remove_samples
-
-            if progressive_length:
-                for n in range(10, 101, 10):
-
-                    progressive_length_samples = [
-                        increase_spans_length_by_n(sample, n, lp) for sample in samples
-                    ]
-
-                    perturbed_autoeval2lp2preprocessed_samples_with_automatic_evaluations[
-                        autoeval + f"_PROGRESSIVE_LENGTH_{n}"
-                    ][
-                        lp
-                    ] = progressive_length_samples
-
-    return (
-        perturbed_autoeval2lp2preprocessed_samples_with_automatic_evaluations,
-        perturbed_autoeval2lp2metadata,
-    )
+    return all_perturbed, all_metadata

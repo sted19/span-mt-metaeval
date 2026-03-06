@@ -382,6 +382,7 @@ def get_autoeval2scores(
 
 def aggregate_metadata(
     metadata: Dict[str, Dict[str, Dict[str, int]]],
+    lps: List[str],
     lp_key: str,
 ) -> Dict[str, Dict[str, Dict[str, int]]]:
     """
@@ -395,7 +396,6 @@ def aggregate_metadata(
         A dictionary of the form {metric name: {metadata name: aggregated metadata value}}
     """
     autoevals = list(metadata.keys())
-    lps = list(next(iter(metadata.values())).keys())
 
     for autoeval in autoevals:
         for lp in lps:

@@ -3,6 +3,7 @@
 
 import argparse
 import logging
+import gc
 from typing import Dict, List, Tuple
 from collections import defaultdict
 from pathlib import Path
@@ -47,6 +48,7 @@ from mt_evaluation.meta_evaluation.utils import (
 from mt_evaluation.meta_evaluation.span_level.preprocessing import (
     count_errors_by_severity,
     compute_evaluations_stats,
+    strip_heavy_fields_from_samples,
 )
 from mt_evaluation.meta_evaluation.span_level.preprocessing import (
     preprocess_samples_with_human_evaluations,
@@ -82,6 +84,158 @@ from mt_evaluation.meta_evaluation.span_level.perturbations import (
 #   3. Non-omissions marked in the source for other categories (e.g., Fluency errors marked in the source)
 
 logger = logging.getLogger(__name__)
+
+
+def read_arguments() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Compute the meta-evaluation (at the span-level) for the given metrics"
+    )
+    parser.add_argument(
+        "--test-sets",
+        type=str,
+        nargs="+",
+        default=["wmt24"],
+        help="The test sets to run the meta-evaluation on",
+    )
+    parser.add_argument(
+        "--annotation-protocol",
+        type=str,
+        default="mqm",
+        help="The annotation protocols to use for the evaluation, in {esa, mqm} (default: mqm)",
+    )
+    parser.add_argument(
+        "--logging-level",
+        type=str,
+        default="INFO",
+        help="The logging level to use (default: INFO)",
+    )
+    parser.add_argument(
+        "--lps",
+        type=str,
+        nargs="+",
+        default=None,
+        help="The language pairs to evaluate (default: wmt24_lps/wmt23_lps).",
+    )
+    parser.add_argument(
+        "--gold-rating-key",
+        type=str,
+        default="mqm.super.1",
+    )
+    parser.add_argument(
+        "--human-as-a-metric-rating-keys",
+        type=str,
+        nargs="*",
+        default=["mqm.super.2", "mqm.super.3"],
+    )
+    parser.add_argument(
+        "--auto-severities",
+        type=str,
+        nargs="+",
+        default=["minor", "major", "critical"],
+        help="The severities to consider in the evaluation (default: minor major critical).",
+    )
+    parser.add_argument(
+        "--human-severities",
+        type=str,
+        nargs="+",
+        default=["minor", "major", "critical"],
+        help="The severities to consider in the evaluation (default: minor major critical).",
+    )
+    parser.add_argument(
+        "--human-categories",
+        type=str,
+        nargs="+",
+        default="All",
+        help="The categories to consider in the human evaluations (default: All).",
+    )
+    parser.add_argument(
+        "--auto-categories",
+        type=str,
+        nargs="+",
+        default="All",
+        help="The categories to consider in the automatic evaluations (default: All).",
+    )
+    parser.add_argument(
+        "--do-not-verify-completeness",
+        action="store_true",
+        help="Do not verify that the automatic evaluations have annotated the FULL dataset. If this is specified, partial annotations are still loaded from the cache and evaluated",
+    )
+
+    parser.add_argument(
+        "--compute-auto-statistics-only-on-the-samples-with-human-errors",
+        action="store_true",
+        help="If this flag is used, automatic statistics are computed only on the samples with human errors. As a consequence, total_errors will be the number of automatic errors in the samples with human errors. This is useful for comparing different autoevaluators when we are filtering to include only the samples that contain some specific category of human errors.",
+    )
+
+    parser.add_argument(
+        "--use-merged-annotations",
+        type=bool,
+        default=True,
+        help="If true, load mqm annotations directly from mqm.merged annotations, rather than from the individual raters.",
+    )
+
+    parser.add_argument(
+        "--severity-penalty",
+        type=float,
+        default=0.0,
+        help="Penalty on severity mismatches",
+    )
+
+    parser.add_argument(
+        "--remove-overlapping-errors",
+        action="store_true",
+        help="Remove overlapping errors both in gold and automatic evaluations",
+    )
+
+    parser.add_argument(
+        "--perturbations",
+        type=str,
+        nargs="*",
+        default=None,
+        choices=list(ALL_PERTURBATIONS) + [[]],
+        help=f"Perturbations to apply to evaluators. Valid values: {', '.join(ALL_PERTURBATIONS)}. "
+        f"If not specified or empty list, no perturbations are generated. "
+        f"Example: --perturbations EXT_ONLY RAND_REMOVE",
+    )
+
+    parser.add_argument(
+        "--fix-edge-cases-in-precision",
+        action="store_true",
+        help="Whether to return p=1 only when all tp, fp, and fn are 0, not only when tp and fp are so.",
+    )
+    parser.add_argument(
+        "--fix-wmt25-indices-with-tgt-annotated",
+        action="store_true",
+        help="Whether to use the correct indices when loading submissions, different from the (wrong) indices used at wmt25",
+    )
+    parser.add_argument(
+        "--transform-critical-into-major",
+        type=bool,
+        default=True,
+        help="Whether to change critical severity into major to not get penalized when severity penalty is used",
+    )
+    parser.add_argument(
+        "--do-not-load-wmt25-submissions",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--use-greedy-matching",
+        action="store_true",
+        help="Whether to use greedy matching instead of optimal matching when computing the metrics.",
+    )
+    parser.add_argument(
+        "--micro-average-across-lps",
+        action="store_true",
+        help="Whether to compute global results by micro-averaging metrics across language pairs instead of macro-averaging results across language pairs.",
+    )
+    parser.add_argument(
+        "--tsv-specific-info",
+        type=str,
+        default="default",
+        help="Any specific info to add to the TSV output file name (e.g., for logging or debugging purposes).",
+    )
+
+    return parser
 
 
 def main():
@@ -268,6 +422,11 @@ def main():
                     ][
                         sys
                     ]
+    
+    # Free the per-test-set structures — they've been collapsed and are no longer needed
+    del test_set2lp2sys2samples_with_human_evaluations
+    del autoeval2test_set2lp2sys2samples_with_automatic_evaluations
+    gc.collect()
 
     # Parse perturbations argument
     enabled_perturbations = set(args.perturbations) if args.perturbations else []
@@ -463,23 +622,37 @@ def main():
         # Sequential processing (useful for debugging)
         logger.info("Running in sequential mode (num_workers=1)")
         preprocessing_results = [
-            preprocess_single_autoeval_wrapper(args) for args in autoeval_args
+            preprocess_single_autoeval_wrapper(_args) for _args in autoeval_args
         ]
 
     logger.info("Preprocessing: All auto-evaluators completed!")
 
+    # Free the raw (pre-preprocessed) samples — no longer needed after preprocessing
+    del autoeval2lp2sys2samples_with_automatic_evaluations
+    del autoeval_args
+    gc.collect()
+
     # Merge results back into main data structures
     autoeval2lp2preprocessed_samples_with_automatic_evaluations = dict()
     for (
-        autoeval,
-        metric_stats,
-        lp2preprocessed_samples_with_automatic_evaluations,
+        _autoeval,
+        _metric_stats,
+        _lp2preprocessed_samples_with_automatic_evaluations,
     ) in preprocessing_results:
-        for lp in lps:
-            metrics_stats[lp][autoeval] = metric_stats[lp]
-            autoeval2lp2preprocessed_samples_with_automatic_evaluations[autoeval] = (
-                lp2preprocessed_samples_with_automatic_evaluations
+        for _lp in lps:
+            metrics_stats[_lp][_autoeval] = _metric_stats[_lp]
+            autoeval2lp2preprocessed_samples_with_automatic_evaluations[_autoeval] = (
+                _lp2preprocessed_samples_with_automatic_evaluations
             )
+    
+    del preprocessing_results
+    gc.collect()
+    
+    # 1. Strip heavyweight fields (annotation, prompts, etc.) before perturbation
+        #    expansion to avoid copying kilobytes of dead-weight strings per variant
+    for _autoeval, _lp2preprocessed_samples_with_automatic_evaluations in autoeval2lp2preprocessed_samples_with_automatic_evaluations.items():
+        for _lp, _preprocessed_samples_with_automatic_evaluations in _lp2preprocessed_samples_with_automatic_evaluations.items():
+            strip_heavy_fields_from_samples(_preprocessed_samples_with_automatic_evaluations)
 
     (
         autoeval2lp2preprocessed_samples_with_automatic_evaluations,
@@ -559,8 +732,11 @@ def main():
         # Sequential processing (useful for debugging)
         logger.info("Running in sequential mode (num_workers=1)")
         processing_results = [
-            process_single_autoeval_wrapper(args) for args in autoeval_args
+            process_single_autoeval_wrapper(_args) for _args in autoeval_args
         ]
+
+    del autoeval2lp2preprocessed_samples_with_automatic_evaluations
+    gc.collect()
 
     logger.info("Processing: All auto-evaluators (with sentinels) completed!")
 
@@ -573,7 +749,9 @@ def main():
 
     results = compute_results_from_metrics(metrics)
 
-    tsv_output_dir = Path(f"generated/tsv/{"-".join(test_sets)}/{annotation_protocol}")
+    tsv_output_dir = Path(
+        f"generated/tsv/{"-".join(test_sets)}/{annotation_protocol}/{args.tsv_specific_info}"
+    )
 
     # Print tables for each language pair
     for lp in lps:
@@ -602,7 +780,7 @@ def main():
         global_results = macro_average_results_across_lps(results, global_key)
 
     global_autoeval2lp2perturbations_metadata = aggregate_metadata(
-        autoeval2lp2perturbations_metadata, global_key
+        autoeval2lp2perturbations_metadata, lps, global_key
     )
     global_stats: Dict[str, MetricStats] = aggregate_stats(metrics_stats)
 
@@ -618,152 +796,6 @@ def main():
         tsv_output_dir,
         global_autoeval2lp2perturbations_metadata,
     )
-
-
-def read_arguments() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Compute the meta-evaluation (at the span-level) for the given metrics"
-    )
-    parser.add_argument(
-        "--test-sets",
-        type=str,
-        nargs="+",
-        default=["wmt24"],
-        help="The test sets to run the meta-evaluation on",
-    )
-    parser.add_argument(
-        "--annotation-protocol",
-        type=str,
-        default="mqm",
-        help="The annotation protocols to use for the evaluation, in {esa, mqm} (default: mqm)",
-    )
-    parser.add_argument(
-        "--logging-level",
-        type=str,
-        default="INFO",
-        help="The logging level to use (default: INFO)",
-    )
-    parser.add_argument(
-        "--lps",
-        type=str,
-        nargs="+",
-        default=None,
-        help="The language pairs to evaluate (default: wmt24_lps/wmt23_lps).",
-    )
-    parser.add_argument(
-        "--gold-rating-key",
-        type=str,
-        default="mqm.super.1",
-    )
-    parser.add_argument(
-        "--human-as-a-metric-rating-keys",
-        type=str,
-        nargs="*",
-        default=["mqm.super.2", "mqm.super.3"],
-    )
-    parser.add_argument(
-        "--auto-severities",
-        type=str,
-        nargs="+",
-        default=["minor", "major", "critical"],
-        help="The severities to consider in the evaluation (default: minor major critical).",
-    )
-    parser.add_argument(
-        "--human-severities",
-        type=str,
-        nargs="+",
-        default=["minor", "major", "critical"],
-        help="The severities to consider in the evaluation (default: minor major critical).",
-    )
-    parser.add_argument(
-        "--human-categories",
-        type=str,
-        nargs="+",
-        default="All",
-        help="The categories to consider in the human evaluations (default: All).",
-    )
-    parser.add_argument(
-        "--auto-categories",
-        type=str,
-        nargs="+",
-        default="All",
-        help="The categories to consider in the automatic evaluations (default: All).",
-    )
-    parser.add_argument(
-        "--do-not-verify-completeness",
-        action="store_true",
-        help="Do not verify that the automatic evaluations have annotated the FULL dataset. If this is specified, partial annotations are still loaded from the cache and evaluated",
-    )
-
-    parser.add_argument(
-        "--compute-auto-statistics-only-on-the-samples-with-human-errors",
-        action="store_true",
-        help="If this flag is used, automatic statistics are computed only on the samples with human errors. As a consequence, total_errors will be the number of automatic errors in the samples with human errors. This is useful for comparing different autoevaluators when we are filtering to include only the samples that contain some specific category of human errors.",
-    )
-
-    parser.add_argument(
-        "--use-merged-annotations",
-        type=bool,
-        default=True,
-        help="If true, load mqm annotations directly from mqm.merged annotations, rather than from the individual raters.",
-    )
-
-    parser.add_argument(
-        "--severity-penalty",
-        type=float,
-        default=0.0,
-        help="Penalty on severity mismatches",
-    )
-
-    parser.add_argument(
-        "--remove-overlapping-errors",
-        action="store_true",
-        help="Remove overlapping errors both in gold and automatic evaluations",
-    )
-
-    parser.add_argument(
-        "--perturbations",
-        type=str,
-        nargs="*",
-        default=None,
-        choices=list(ALL_PERTURBATIONS) + [[]],
-        help=f"Perturbations to apply to evaluators. Valid values: {', '.join(ALL_PERTURBATIONS)}. "
-        f"If not specified or empty list, no perturbations are generated. "
-        f"Example: --perturbations EXT_ONLY RAND_REMOVE",
-    )
-
-    parser.add_argument(
-        "--fix-edge-cases-in-precision",
-        action="store_true",
-        help="Whether to return p=1 only when all tp, fp, and fn are 0, not only when tp and fp are so.",
-    )
-    parser.add_argument(
-        "--fix-wmt25-indices-with-tgt-annotated",
-        action="store_true",
-        help="Whether to use the correct indices when loading submissions, different from the (wrong) indices used at wmt25",
-    )
-    parser.add_argument(
-        "--transform-critical-into-major",
-        type=bool,
-        default=True,
-        help="Whether to change critical severity into major to not get penalized when severity penalty is used",
-    )
-    parser.add_argument(
-        "--do-not-load-wmt25-submissions",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--use-greedy-matching",
-        action="store_true",
-        help="Whether to use greedy matching instead of optimal matching when computing the metrics.",
-    )
-    parser.add_argument(
-        "--micro-average-across-lps",
-        action="store_true",
-        help="Whether to compute global results by micro-averaging metrics across language pairs instead of macro-averaging results across language pairs.",
-    )
-
-    return parser
 
 
 if __name__ == "__main__":
