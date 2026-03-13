@@ -67,7 +67,7 @@ from mt_evaluation.meta_evaluation.span_level.perturbations import (
     ALL_PERTURBATIONS,
 )
 
-# NOTE: aspects of the meta-evaluation to remember
+# NOTE: choices made in the meta-evaluation design and implementation:
 #   HANDLING OF HUMAN ERRORS
 #  1. We are not considering neutral errors even for the span-based matching (to be coherent with their MQM score of 0)
 #  2. We are not considering error categories that do not refer to actual translation errors such as source issue or creative reinterpretation
@@ -75,13 +75,7 @@ from mt_evaluation.meta_evaluation.span_level.perturbations import (
 #   HANDLING OF AUTOMATIC ERRORS
 #  1. Ill-formed errors (i.e., empty errors, or those whose text is not entirely contained in the translation or the source), are excluded from the evaluation
 #   HANDLING OF MATCHING ALGORITHMS
-#  1. By default, we use optimal matching (in terms of f1_with_partial_overlap_and_partial_credit). This is used also for exact_match and partial_overlap, despite it might (might it?) be not optimal for them. This behavior is incorrect and must be edited.
-
-
-# NOTE: predominant LLM errors and parsing errors
-#   1. Omission not marked in the source, but in the target
-#   2. Omission has an empty span --> it is true that omitted text is NOT there, but the LLM should not mark an empty span. Rather, should mark the omitted span in the source
-#   3. Non-omissions marked in the source for other categories (e.g., Fluency errors marked in the source)
+#  1. By default, we use optimal one-to-one matching between auto-evaluator and human errors. For each metric, we compute a different one-to-one matching based on the optimal assignment for that specific metric.
 
 logger = logging.getLogger(__name__)
 
@@ -202,11 +196,6 @@ def read_arguments() -> argparse.ArgumentParser:
         "--fix-edge-cases-in-precision",
         action="store_true",
         help="Whether to return p=1 only when all tp, fp, and fn are 0, not only when tp and fp are so.",
-    )
-    parser.add_argument(
-        "--fix-wmt25-indices-with-tgt-annotated",
-        action="store_true",
-        help="Whether to use the correct indices when loading submissions, different from the (wrong) indices used at wmt25",
     )
     parser.add_argument(
         "--transform-critical-into-major",
@@ -355,7 +344,6 @@ def main():
                         autoeval_entry,
                         wmt25_submission_path,
                         lps=lps,
-                        fix_indices_with_tgt_annotated=args.fix_wmt25_indices_with_tgt_annotated,
                     )
                 )
 
@@ -422,7 +410,7 @@ def main():
                     ][
                         sys
                     ]
-    
+
     # Free the per-test-set structures — they've been collapsed and are no longer needed
     del test_set2lp2sys2samples_with_human_evaluations
     del autoeval2test_set2lp2sys2samples_with_automatic_evaluations
@@ -644,15 +632,23 @@ def main():
             autoeval2lp2preprocessed_samples_with_automatic_evaluations[_autoeval] = (
                 _lp2preprocessed_samples_with_automatic_evaluations
             )
-    
+
     del preprocessing_results
     gc.collect()
-    
+
     # 1. Strip heavyweight fields (annotation, prompts, etc.) before perturbation
-        #    expansion to avoid copying kilobytes of dead-weight strings per variant
-    for _autoeval, _lp2preprocessed_samples_with_automatic_evaluations in autoeval2lp2preprocessed_samples_with_automatic_evaluations.items():
-        for _lp, _preprocessed_samples_with_automatic_evaluations in _lp2preprocessed_samples_with_automatic_evaluations.items():
-            strip_heavy_fields_from_samples(_preprocessed_samples_with_automatic_evaluations)
+    #    expansion to avoid copying kilobytes of dead-weight strings per variant
+    for (
+        _autoeval,
+        _lp2preprocessed_samples_with_automatic_evaluations,
+    ) in autoeval2lp2preprocessed_samples_with_automatic_evaluations.items():
+        for (
+            _lp,
+            _preprocessed_samples_with_automatic_evaluations,
+        ) in _lp2preprocessed_samples_with_automatic_evaluations.items():
+            strip_heavy_fields_from_samples(
+                _preprocessed_samples_with_automatic_evaluations
+            )
 
     (
         autoeval2lp2preprocessed_samples_with_automatic_evaluations,

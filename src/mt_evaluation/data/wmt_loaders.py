@@ -19,7 +19,6 @@ from mt_metrics_eval import ratings as mt_metrics_eval_ratings
 
 from mt_evaluation.core import Sample, HumanEvaluation, Error, AutomaticEvaluation
 from mt_evaluation.core import no_error, no_error2, wmt25_lps_mqm, wmt25_lps_esa
-from mt_evaluation.core import no_error, no_error2, wmt25_lps_mqm, wmt25_lps_esa
 from mt_evaluation.core.scoring import assign_score_based_on_severity
 from mt_evaluation.utils import find_all_literal
 from mt_evaluation.data.language_codes import lang_code2lang
@@ -96,7 +95,6 @@ def parse_tsv_wmt25_submission(
     autoeval_name: str,
     filepath: Path,
     lps: List[str],
-    fix_indices_with_tgt_annotated: bool = False,
 ) -> Dict[str, Dict[str, List[Sample]]]:
     """
     Load TSV data with space-separated values in the last three columns.
@@ -107,7 +105,6 @@ def parse_tsv_wmt25_submission(
         autoeval_name: Name of the automatic evaluator
         filepath: Path to the .tsv file
         lps: Language pairs to process
-        fix_indices_with_tgt_annotated: Whether to fix indices using annotated target
 
     Returns:
         Dictionary mapping lp -> system -> samples with automatic evaluations
@@ -274,61 +271,6 @@ def convert_raw_esa_evaluation_to_human_evaluation(
     return HumanEvaluation(score=esa_score, errors=errors, rater=rater)
 
 
-def get_wmt25_esa_rater_data_from_raw_jsonl(
-    json_path: Path, lps: List[str]
-) -> Dict[str, Dict[str, Dict[str, List[Sample]]]]:
-    """Load WMT25 ESA rater data from raw JSONL file."""
-    data = [json.loads(line) for line in open(json_path)]
-
-    rater2lp2sys2samples = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-
-    for data_sample in data:
-        src = data_sample["src_text"]
-        tgts = data_sample["tgt_text"]
-        doc_id = data_sample["doc_id"]
-        sys2scores = data_sample["scores"]
-
-        lp = doc_id.split("_#_")[0]
-        seg_id = int(doc_id.split("_#_")[-1])
-        doc_id = "_#_".join(doc_id.split("_#_")[:-1])
-
-        if lp not in lps:
-            continue
-
-        src_lang = lang_code2lang[lp.split("-")[0]]
-        tgt_lang = lang_code2lang[lp.split("-")[1]]
-
-        for sys, scores in sys2scores.items():
-            tgt = tgts[sys]
-
-            assert len(scores) == 2, f"len(scores)={len(scores)} != 2!"
-
-            eval1 = scores[0]
-            eval2 = scores[1]
-
-            human_1_eval = convert_raw_esa_evaluation_to_human_evaluation(eval1, tgt)
-            human_2_eval = convert_raw_esa_evaluation_to_human_evaluation(eval2, tgt)
-
-            sample1 = Sample(
-                src=src,
-                tgt=tgt,
-                src_lang=src_lang,
-                tgt_lang=tgt_lang,
-                evaluation=None,
-                human_evaluation=human_1_eval,
-                doc_id=doc_id,
-                seg_id=seg_id,
-            )
-
-            sample2 = Sample.from_dict(sample1.to_dict())
-            sample2.human_eval = human_2_eval
-
-            rater2lp2sys2samples["esa.human.1"][lp][sys].append(sample1)
-            rater2lp2sys2samples["esa.human.2"][lp][sys].append(sample2)
-
-    return rater2lp2sys2samples
-
-
 def map_to_list_of_samples_and_sanity_check(
     json_human_1: Dict,
     json_human_2: Dict,
@@ -459,7 +401,7 @@ def get_wmt25_esa_human1_and_2_data_from_raw_json(
                     is_source_error=is_source_error,
                     score=assign_score_based_on_severity(
                         severity
-                    ),  # There is no score in the esa files that I got from sweta, so I'm using MQM weighting just to have a score there
+                    ),  # There is no score in the esa span-level data files; I'm using MQM weighting.
                 )
             )
 
@@ -708,7 +650,7 @@ def get_raters_evaluations(
         elif annotation_protocol == "esa":
             esa_lps = [lp for lp in lps if lp in wmt25_lps_esa]
 
-            # NOTE: this code loads the data from Sweta's task2 files. However, it seems it is not possible to get which samples were manually evaluated and which, instead, had 0 errors.
+            # TODO: this code loads the data from the WMT25 task2 data files that I got sent privately. This path is hardcoded and should be replaced when public data for WMT25 task2 is available.
             json_path_human_1 = Path(
                 f"data/wmt25/data/task2_with_human_annotations_unique_errors_human1.json"
             )
@@ -736,15 +678,6 @@ def get_raters_evaluations(
                         samples_human_2, esa_lps
                     )
                 )
-
-            """
-            # NOTE: This code instead uses the data from here: https://github.com/wmt-conference/wmt25-general-mt/blob/main/data/wmt25-genmt-humeval.jsonl
-            #   However, also in this case there are problems: the metrics shared task reset the segment_ids, creating global segment ids (while the ones from genMT start from zero for each new doc_id). As a consequence, it is not possible to match the samples in the test set with those from the submissions.
-            jsonl_path_esa = Path(f"data/wmt25/data/wmt25-genmt-humeval.jsonl")
-            rater2lp2sys2samples = get_wmt25_esa_rater_data_from_raw_jsonl(
-                jsonl_path_esa, esa_lps
-            )
-            """
         else:
             raise ValueError(f"Unknown annotation protocol: {annotation_protocol}")
 
