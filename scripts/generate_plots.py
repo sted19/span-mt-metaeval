@@ -32,11 +32,11 @@ matplotlib.rcParams.update(
         "text.usetex": True,
         "font.family": "serif",
         "font.serif": ["Computer Modern Roman"],
-        "axes.labelsize": 13,
-        "font.size": 11,
-        "legend.fontsize": 10,
-        "xtick.labelsize": 11,
-        "ytick.labelsize": 11,
+        "axes.labelsize": 20,
+        "font.size": 16,
+        "legend.fontsize": 18,
+        "xtick.labelsize": 16,
+        "ytick.labelsize": 16,
     }
 )
 
@@ -51,9 +51,32 @@ REMOVE_ALL_1_RE = re.compile(r"^(.+?)_REMOVE_ALL_1_(\d+)_(\d+)$")
 METRIC_TYPE_CHOICES = [
     "exact_match",
     "partial_overlap",
-    "character_counts",
     "character_proportion",
 ]
+
+CAMERA_READY_METRIC_NAMES_MAP = {
+    "exact_match": r"Exact Match (EM)",
+    "partial_overlap": r"Match with partial overlap (MP)",
+    "character_proportion": r"Macth with partial overlap and partial credit (MPP)",
+}
+
+CAMERA_READY_METRIC_NAMES_SHORT_MAP = {
+    "exact_match": "EM",
+    "partial_overlap": "MP",
+    "character_proportion": "MPP",
+}
+
+CAMERA_READY_MODEL_NAMES_MAP = {
+    "claude-haiku-4-5": "Claude Haiku 4.5",
+    "claude-sonnet-4-5": "Claude Sonnet 4.5",
+    "gpt-oss-120b": "gpt-oss 120b",
+    "qwen3-235b": "Qwen3 235b",
+}
+
+CAMERA_READY_AGGREGATION_NAMES_MAP = {
+    "micro": "Micro-averaged",
+    "macro": "Macro-averaged",
+}
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -93,7 +116,7 @@ def read_arguments() -> argparse.ArgumentParser:
         "--metric-type",
         type=str,
         nargs="+",
-        required=True,
+        default=["exact_match", "partial_overlap", "character_proportion"],
         choices=METRIC_TYPE_CHOICES,
         help="One or more metric types to plot. When multiple are given "
         "they appear in the same plot with different line styles.",
@@ -129,6 +152,15 @@ def read_arguments() -> argparse.ArgumentParser:
         type=str,
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+    )
+    parser.add_argument(
+        "--run-specific-info",
+        type=str,
+        default="default",
+        help=(
+            "Additional string to distinguish this run in log messages and "
+            "input paths (default: 'default')."
+        ),
     )
     return parser
 
@@ -276,17 +308,64 @@ def _shorten_labels(names: List[str]) -> List[str]:
     else:
         prefix = ""
     shortened = [n[len(prefix) :] for n in names]
-    # Fall back to originals if stripping made them empty
-    if any(s == "" for s in shortened):
-        return names
-    return shortened
+    
+    return [CAMERA_READY_MODEL_NAMES_MAP[name] for name in shortened]
+
+
+def _save_legend_separately(
+    handles,
+    labels,
+    output_path: Path,
+    formats: List[str],
+    ) -> None:
+    """Render *only* the legend into its own horizontal-strip image file(s)."""
+    import math
+
+    # Filter out blank-separator entries so ncol only counts real items
+    real_handles, real_labels = zip(
+        *[(h, l) for h, l in zip(handles, labels) if l]
+    )
+    real_handles = list(real_handles)
+    real_labels = list(real_labels)
+
+    ncol = min(len(real_labels), 7)
+    nrow = math.ceil(len(real_labels) / ncol)
+
+    # Matplotlib fills legends column-first.  Reorder so that column-first
+    # reading reproduces the desired row-first order.
+    n = len(real_labels)
+    reordered_idx = []
+    for col in range(ncol):
+        for row in range(nrow):
+            idx = row * ncol + col
+            if idx < n:
+                reordered_idx.append(idx)
+    real_handles = [real_handles[i] for i in reordered_idx]
+    real_labels = [real_labels[i] for i in reordered_idx]
+
+    fig_leg = plt.figure()
+    legend = fig_leg.legend(
+        real_handles,
+        real_labels,
+        loc="center",
+        ncol=ncol,
+        frameon=False,
+    )
+    fig_leg.canvas.draw()
+    bbox = legend.get_window_extent().transformed(fig_leg.dpi_scale_trans.inverted())
+    for fmt in formats:
+        save_path = output_path.with_suffix(f".{fmt}")
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig_leg.savefig(save_path, dpi=150, bbox_inches=bbox)
+        logger.info("Saved legend: %s", save_path)
+    plt.close(fig_leg)
 
 
 def plot_progressive_f1(
     metric_evaluator_data: Dict[str, Dict[str, List[Tuple[int, float]]]],
-    title: str,
     output_path: Path,
     formats: List[str],
+    aggregation: str,
 ) -> None:
     """
     Create and save a line plot of F1 vs progressive span-length level.
@@ -298,10 +377,11 @@ def plot_progressive_f1(
         When there is a single metric type the plot uses solid lines only.
         With multiple metric types each type gets a distinct line style.
     """
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(8, 6))
 
-    metric_types = sorted(metric_evaluator_data.keys())
-    line_styles = ["-", "--", "-.", ":"]
+    metric_types = list(metric_evaluator_data.keys())
+    cr_metric_types = [CAMERA_READY_METRIC_NAMES_SHORT_MAP[mt] for mt in metric_types]
+    line_styles = ["solid", "dashed", "dotted"]
 
     # Collect all evaluator names across metric types for consistent colours
     all_evaluators: set = set()
@@ -313,7 +393,7 @@ def plot_progressive_f1(
         name: _latex_escape(label) for name, label in zip(sorted_names, short_labels)
     }
 
-    markers = ["o", "s", "^", "D", "v", "P", "X", "*", "h", "<"]
+    markers = ["o"]
     # Assign a consistent colour per evaluator
     cmap = plt.get_cmap("tab10")
     color_map = {name: cmap(i % 10) for i, name in enumerate(sorted_names)}
@@ -350,8 +430,9 @@ def plot_progressive_f1(
                 color=color_map[name],
             )
 
-    ax.set_xlabel(r"Span Length (\#chars added before and after error spans)", fontsize=13)
-    ax.set_ylabel(r"$F$-Score", fontsize=13)
+    cr_aggregation = CAMERA_READY_AGGREGATION_NAMES_MAP[aggregation]
+    ax.set_xlabel(r"Span Length (\#additional leading and trailing chars per span)")
+    ax.set_ylabel(fr"$F$-Score ({cr_aggregation})")
     # ax.set_title(_latex_escape(title), fontsize=14)
 
     # Build the legend: evaluator names (colour) + line-style key if multi-metric
@@ -362,12 +443,11 @@ def plot_progressive_f1(
         # Add a blank separator then line-style entries for each metric type
         handles.append(Line2D([], [], linestyle="none"))
         labels.append("")
-        for mt_idx, metric_type in enumerate(metric_types):
+        for mt_idx, cr_metric_type in enumerate(cr_metric_types):
             ls = line_styles[mt_idx % len(line_styles)]
             handles.append(Line2D([], [], color="gray", linestyle=ls, linewidth=2))
-            labels.append(_latex_escape(metric_type))
+            labels.append(_latex_escape(cr_metric_type))
 
-    ax.legend(handles, labels, fontsize=10)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
 
@@ -379,13 +459,17 @@ def plot_progressive_f1(
 
     plt.close(fig)
 
+    # Save legend as a separate image
+    legend_path = output_path.parent / (output_path.name + "_legend")
+    _save_legend_separately(handles, labels, legend_path, formats)
+
 
 def plot_rand_remove_f1(
     metric_rand_data: Dict[str, Dict[str, List[Tuple[int, float]]]],
     metric_remove_all_data: Dict[str, Dict[str, List[Tuple[float, float]]]],
-    title: str,
     output_path: Path,
     formats: List[str],
+    aggregation: str,
 ) -> None:
     """Create and save a line plot of F1 vs error-removal percentage.
 
@@ -400,8 +484,10 @@ def plot_rand_remove_f1(
     """
     fig, ax = plt.subplots(figsize=(10, 6))
 
-    metric_types = sorted(metric_rand_data.keys())
-    line_styles = ["-", "--", "-.", ":"]
+    metric_types = list(metric_rand_data.keys())
+    cr_metric_types = [CAMERA_READY_METRIC_NAMES_SHORT_MAP[mt] for mt in metric_types]
+    line_styles = ["solid", "dashed", "dotted"]
+    scatter_markers = ["x", "+", "*"]
 
     # Collect all evaluator names across metric types for consistent colours
     all_evaluators: set = set()
@@ -413,7 +499,7 @@ def plot_rand_remove_f1(
         name: _latex_escape(label) for name, label in zip(sorted_names, short_labels)
     }
 
-    markers = ["o", "s", "^", "D", "v", "P", "X", "*", "h", "<"]
+    markers = ["o"] 
     cmap = plt.get_cmap("tab10")
     color_map = {name: cmap(i % 10) for i, name in enumerate(sorted_names)}
 
@@ -450,6 +536,7 @@ def plot_rand_remove_f1(
     # --- REMOVE_ALL_1 scatter points ---
     for mt_idx, metric_type in enumerate(metric_types):
         rem_data = metric_remove_all_data.get(metric_type, {})
+        s_marker = scatter_markers[mt_idx % len(scatter_markers)]
         for name in sorted_names:
             if name not in rem_data:
                 continue
@@ -457,45 +544,49 @@ def plot_rand_remove_f1(
                 ax.scatter(
                     eff_pct,
                     f1,
-                    marker="x",
+                    marker=s_marker,
                     s=120,
                     linewidths=2.5,
                     color=color_map[name],
                     zorder=5,
                 )
 
-    ax.set_xlabel(r"Error removal probability (\%)", fontsize=13)
-    ax.set_ylabel(r"$F$-Score", fontsize=13)
+    cr_aggregation = CAMERA_READY_AGGREGATION_NAMES_MAP[aggregation]
+    ax.set_xlabel(r"Error removal probability (\%)")
+    ax.set_ylabel(rf"$F$-Score ({cr_aggregation})")
 
     # Build legend
-    handles, labels = ax.get_legend_handles_labels()
-    if multi_metric:
-        from matplotlib.lines import Line2D
-
-        handles.append(Line2D([], [], linestyle="none"))
-        labels.append("")
-        for mt_idx, metric_type in enumerate(metric_types):
-            ls = line_styles[mt_idx % len(line_styles)]
-            handles.append(Line2D([], [], color="gray", linestyle=ls, linewidth=2))
-            labels.append(_latex_escape(metric_type))
-
-    # Add a legend entry for the REMOVE_ALL_1 scatter marker
     from matplotlib.lines import Line2D
 
-    handles.append(
-        Line2D(
-            [],
-            [],
-            marker="x",
-            color="gray",
-            linestyle="none",
-            markersize=8,
-            markeredgewidth=2.5,
-        )
-    )
-    labels.append(r"REMOVE\_ALL\_1")
+    handles, labels = ax.get_legend_handles_labels()
 
-    ax.legend(handles, labels, fontsize=10)
+    # Metric-type line-style entries (line only, no marker)
+    if multi_metric:
+        handles.append(Line2D([], [], linestyle="none"))
+        labels.append("")
+        for mt_idx, cr_metric_type in enumerate(cr_metric_types):
+            ls = line_styles[mt_idx % len(line_styles)]
+            handles.append(Line2D([], [], color="gray", linestyle=ls, linewidth=2))
+            labels.append(_latex_escape(cr_metric_type))
+
+    # REMOVE_ALL_1 entries – one per metric type with its scatter marker
+    handles.append(Line2D([], [], linestyle="none"))
+    labels.append("")
+    for mt_idx, cr_metric_type in enumerate(cr_metric_types):
+        s_marker = scatter_markers[mt_idx % len(scatter_markers)]
+        handles.append(
+            Line2D(
+                [],
+                [],
+                marker=s_marker,
+                color="gray",
+                linestyle="none",
+                markersize=8,
+                markeredgewidth=2.5,
+            )
+        )
+        labels.append(r"Remove-1" + " (" + _latex_escape(cr_metric_type) + ")")
+
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
 
@@ -506,6 +597,10 @@ def plot_rand_remove_f1(
         logger.info("Saved plot: %s", save_path)
 
     plt.close(fig)
+
+    # Save legend as a separate image
+    legend_path = output_path.parent / (output_path.name + "_legend")
+    _save_legend_separately(handles, labels, legend_path, formats)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -526,10 +621,11 @@ def main() -> None:
     output_root = Path(args.output_dir)
     test_sets = args.test_sets
     protocol = args.annotation_protocol
+    run_info = args.run_specific_info
     metric_types: List[str] = args.metric_type
 
     for test_set in test_sets:
-        ts_dir = input_root / test_set / protocol
+        ts_dir = input_root / test_set / protocol / run_info
         if not ts_dir.is_dir():
             logger.warning("Directory not found, skipping: %s", ts_dir)
             continue
@@ -568,9 +664,9 @@ def main() -> None:
                 )
 
                 out_stem = f"{args.aggregation}_{args.matching}_{'__'.join(metric_types)}"
-                out_path = output_root / test_set / protocol / lp_name / out_stem
+                out_path = output_root / test_set / protocol / run_info / lp_name / out_stem
 
-                plot_progressive_f1(metric_evaluator_data, title, out_path, args.format)
+                plot_progressive_f1(metric_evaluator_data, out_path, args.format, args.aggregation)
 
             # -- RAND_REMOVE plots --
             lp_name = lp_dir.name
@@ -597,13 +693,13 @@ def main() -> None:
                     f"{args.aggregation}_{args.matching}"
                     f"_{'__'.join(metric_types)}_rand_remove"
                 )
-                out_path = output_root / test_set / protocol / lp_name / out_stem
+                out_path = output_root / test_set / protocol / run_info / lp_name / out_stem
                 plot_rand_remove_f1(
                     metric_rand_data,
                     metric_remove_all_data,
-                    title,
                     out_path,
                     args.format,
+                    args.aggregation,
                 )
 
     logger.info("Done.")
